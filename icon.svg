@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Traffic light">
+  <rect x="17" y="4" width="30" height="52" rx="9" fill="#1f2430"/>
+  <rect x="17.75" y="4.75" width="28.5" height="50.5" rx="8.25" fill="none" stroke="#3a4152" stroke-width="1.5"/>
+  <circle cx="32" cy="17" r="7" fill="#e5534b"/>
+  <circle cx="32" cy="32" r="7" fill="#e3b341"/>
+  <circle cx="32" cy="47" r="7" fill="#3fb950"/>
+  <circle cx="29.5" cy="14.5" r="2.2" fill="#ffffff" opacity="0.45"/>
+  <circle cx="29.5" cy="29.5" r="2.2" fill="#ffffff" opacity="0.35"/>
+  <circle cx="29.5" cy="44.5" r="2.2" fill="#ffffff" opacity="0.3"/>
+  <rect x="29" y="56" width="6" height="5" rx="1.5" fill="#3a4152"/>
+</svg>

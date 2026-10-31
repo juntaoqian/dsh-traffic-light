@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Traffic Light Status",
+    "description": "Shows a red/amber/green traffic light at the sidebar foot for every session's running and waiting state, beeps when a session is waiting for you, and adds a settings page."
+  }
+}

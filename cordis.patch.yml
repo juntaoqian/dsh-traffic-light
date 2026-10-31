@@ -1,0 +1,3 @@
+- insert:
+    - id: traffic-light
+      name: '@local/dsh-traffic-light'
