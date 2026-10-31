@@ -85,6 +85,17 @@ git clone https://github.com/juntaoqian/dsh-traffic-light.git
 
 Plugins → 找到 `dsh-traffic-light` → **Remove**（或 `plugin_manager` 的 `remove_bundle`）。
 
+### 如果 GitHub 连不上（`connection to github.com timed out` / `Connection was reset`）
+
+DSH 在安装 Git 仓库前会先用 `git ls-remote` 做一次连通性检查（默认 5 秒超时）。国内网络下这一步容易超时，依次尝试：
+
+1. 点重试（通常是偶发）。
+2. 在 profile 的 `cordis.patch.yml` 里给 `pluginManager` 行调大 `githubConnectionTimeoutMs`（例如 `20000`），重启 DSH 后再装。
+3. 先 `git clone`（走代理/镜像）到本地，再用上面的**方式 C（本地目录）**安装。
+4. 在能访问 GitHub 的机器上把仓库打包拷过来，本地安装。
+
+> 作者环境到 GitHub 的连接不稳定，Git 方式安装未能在本机全程实测；**本地目录安装**与插件功能已在 DSH `0.2.1-rc.5` 上验证。仓库本身已设为公开，`api.github.com` 匿名可读。
+
 ## ⚙️ 设置
 
 **Settings → 红绿灯**
