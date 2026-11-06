@@ -82,6 +82,8 @@ registerModule({
 
     /** Same-origin route the Host half mounts to perform the real request. */
     const BOARD_PROXY = '/dsh-traffic-light/api/board/report'
+    /** Same-origin route that reports this machine's name, used as the default label. */
+    const BOARD_INFO = '/dsh-traffic-light/api/board/info'
 
     /** Selectable alert timbres; the first one is the fallback. */
     const SOUND_KEYS = ['classic', 'chime', 'ping', 'alert', 'deep', 'rise']
@@ -101,7 +103,7 @@ registerModule({
       boardBase: BOARD_BASE,
       boardSharecode: BOARD_SHARECODE,
       boardKey: BOARD_KEY,
-      boardName: 'DSH',
+      boardName: '',
       boardText: true,
     })
 
@@ -126,6 +128,12 @@ registerModule({
       return trimmed.slice(0, maxLength)
     }
 
+    /** Trimmed, length-capped string option where empty is a meaningful value. */
+    function optionalText(value, maxLength) {
+      if (typeof value !== 'string') return ''
+      return value.trim().slice(0, maxLength)
+    }
+
     function normalizeOptions(raw) {
       const source = raw !== null && typeof raw === 'object' ? raw : {}
       return {
@@ -145,7 +153,7 @@ registerModule({
         boardBase: textOption(source.boardBase, DEFAULT_OPTIONS.boardBase, 300),
         boardSharecode: textOption(source.boardSharecode, DEFAULT_OPTIONS.boardSharecode, 64),
         boardKey: textOption(source.boardKey, DEFAULT_OPTIONS.boardKey, 128),
-        boardName: textOption(source.boardName, DEFAULT_OPTIONS.boardName, 24),
+        boardName: optionalText(source.boardName, 24),
         boardText: source.boardText !== false,
       }
     }
@@ -346,6 +354,8 @@ registerModule({
         secret: typeof source.secret === 'string' ? source.secret : '',
         code: typeof source.code === 'string' ? source.code : '',
         channel,
+        /** This machine's name, reported by the Host half; the default label. */
+        hostLabel: typeof source.hostLabel === 'string' ? source.hostLabel : '',
         status: channel === '' ? 'idle' : 'ready',
         message: '',
         at: 0,
@@ -361,6 +371,7 @@ registerModule({
             secret: info.secret,
             code: info.code,
             channel: info.channel,
+            hostLabel: info.hostLabel,
           }),
         )
       } catch (error) {
@@ -415,8 +426,27 @@ registerModule({
     }
 
     function readBoardName(options) {
-      const name = typeof options.boardName === 'string' ? options.boardName.trim() : ''
-      return (name === '' ? DEFAULT_OPTIONS.boardName : name).slice(0, 24)
+      const explicit = typeof options.boardName === 'string' ? options.boardName.trim() : ''
+      const name = explicit !== '' ? explicit : boardInfo.hostLabel
+      return (name === '' ? 'DSH' : name).slice(0, 24)
+    }
+
+    /** Ask the Host half for this machine's name; it becomes the default label. */
+    async function loadHostLabel() {
+      if (boardInfo.hostLabel !== '') return
+      try {
+        const response = await fetch(BOARD_INFO, { method: 'GET' })
+        if (!response.ok) return
+        const data = await response.json()
+        const name =
+          data !== null && typeof data === 'object' && typeof data.hostname === 'string'
+            ? data.hostname.trim().slice(0, 24)
+            : ''
+        if (name === '' || name === boardInfo.hostLabel) return
+        setBoardInfo({ hostLabel: name })
+      } catch (error) {
+        // The Host route is optional: the literal default label still works.
+      }
     }
 
     /** Build one API URL; `sharecode` rides on every request and is never omitted. */
@@ -599,21 +629,55 @@ registerModule({
       }
     }
 
+    /** The board is a Chinese-only product, so its captions are built here. */
+    const BOARD_KINDS = Object.freeze({
+      approval: '审批',
+      question: '回答',
+      plan: '确认计划',
+      other: '操作',
+    })
+
+    /** `刚刚` / `已等 3 分钟` / `已等 1 小时 5 分钟`, for the public caption. */
+    function formatWaitZh(ms) {
+      const minutes = Math.floor(ms / 60000)
+      if (minutes < 1) return '刚刚'
+      if (minutes < 60) return `已等 ${minutes} 分钟`
+      const hours = Math.floor(minutes / 60)
+      const rest = minutes % 60
+      return rest === 0 ? `已等 ${hours} 小时` : `已等 ${hours} 小时 ${rest} 分钟`
+    }
+
+    /** `审批 / 回答` style list of the waiting kinds. */
+    function boardKindText(kinds) {
+      if (kinds === undefined || kinds.size === 0) return ''
+      return ['approval', 'question', 'plan', 'other']
+        .filter((kind) => kinds.has(kind))
+        .map((kind) => BOARD_KINDS[kind])
+        .join(' / ')
+    }
+
     /**
      * Map the local verdict onto the board's semantic vocabulary.
      * `action` is "waiting for a human" (red, beeping, blinking) and `ok` is
      * "running", which is exactly what the sidebar lamps mean here.
+     *
+     * The caption never carries session titles or paths: the board is public.
+     * Saying *why* it waits (approval / question / plan review) and for how long
+     * is what a remote reader actually needs.
      */
     function boardState(options, summary) {
       const name = readBoardName(options)
       if (summary.state === 'red') {
+        const kind = boardKindText(summary.kinds)
+        const waited = redSince === 0 ? '' : `（${formatWaitZh(Date.now() - redSince)}）`
+        const text =
+          summary.waiting > 1
+            ? `${name}：${summary.waiting} 个会话等你处理${kind === '' ? '' : `（${kind}）`}${waited}`
+            : `${name}：等你${kind === '' ? BOARD_KINDS.other : kind}${waited}`
         return {
           status: 'action',
           label: `${name}：需要你操作`.slice(0, 40),
-          text:
-            summary.waiting > 1
-              ? `${name}：${summary.waiting} 个会话等待选择`
-              : `${name}：有会话在等你选择`,
+          text,
         }
       }
       if (summary.state === 'green') {
@@ -731,18 +795,29 @@ registerModule({
     /**
      * Fold the page-wide session status map into one traffic-light state.
      * Each entry is `{ running, pendingInteraction, completionUnread }`.
+     *
+     * Besides the verdict this keeps three things the caption uses: which kind
+     * of choice is blocking (`kinds`), how many sessions finished since you last
+     * looked (`completed`), and whether anything is still going (`running`).
      */
     function summarizeStatuses(statuses, greenMode) {
       let total = 0
       let running = 0
       let waiting = 0
+      let completed = 0
+      /** @type {Map<string, number>} */
+      const kinds = new Map()
       if (statuses && typeof statuses.forEach === 'function') {
         statuses.forEach((status) => {
           if (status === undefined || status === null) return
           total += 1
           if (status.running === true) running += 1
-          if (status.pendingInteraction !== undefined && status.pendingInteraction !== null) {
+          if (status.completionUnread === true) completed += 1
+          const interaction = status.pendingInteraction
+          if (interaction !== undefined && interaction !== null) {
             waiting += 1
+            const kind = interactionKind(interaction)
+            kinds.set(kind, (kinds.get(kind) || 0) + 1)
           }
         })
       }
@@ -750,7 +825,77 @@ registerModule({
       if (waiting > 0) state = 'red'
       else if (greenMode === 'all') state = total > 0 && running === total ? 'green' : 'yellow'
       else state = running > 0 ? 'green' : 'yellow'
-      return { state, total, running, waiting }
+      return { state, total, running, waiting, completed, kinds }
+    }
+
+    /**
+     * Classify a pending interaction. DSH reports interaction objects from
+     * several domains; the kind is read defensively (the property name has
+     * varied) so an unknown shape still yields a usable label instead of "undefined".
+     *
+     * @param {unknown} interaction the pending interaction object.
+     * @returns {'approval'|'question'|'plan'|'other'} label key.
+     */
+    function interactionKind(interaction) {
+      const source =
+        interaction !== null && typeof interaction === 'object'
+          ? /** @type {Record<string, unknown>} */ (interaction)
+          : {}
+      const raw = [source.kind, source.type, source.name]
+        .filter((value) => typeof value === 'string' && value !== '')
+        .join(' ')
+        .toLowerCase()
+      if (raw === '') return 'other'
+      if (/plan/.test(raw)) return 'plan'
+      if (/question|ask|input|answer|choice/.test(raw)) return 'question'
+      if (/approval|approve|permission|confirm|tool/.test(raw)) return 'approval'
+      return 'other'
+    }
+
+    /** Short "审批 / 提问 / 计划确认" summary of the waiting kinds, most common first. */
+    function kindsSummary(kinds, t) {
+      if (kinds === undefined || kinds.size === 0) return ''
+      const order = { approval: 0, question: 1, plan: 2, other: 3 }
+      return [...kinds.keys()]
+        .sort((left, right) => (order[left] ?? 9) - (order[right] ?? 9))
+        .map((kind) => t(`kind.${kind}`))
+        .join(' / ')
+    }
+
+    /** `3 分钟` / `1 小时 5 分钟`; empty under a minute so the caption stays short. */
+    function formatDuration(ms, t) {
+      if (typeof ms !== 'number' || ms < 60000) return ''
+      const minutes = Math.floor(ms / 60000)
+      if (minutes < 60) return t('duration.minutes', { count: minutes })
+      const hours = Math.floor(minutes / 60)
+      const rest = minutes % 60
+      return rest === 0
+        ? t('duration.hours', { count: hours })
+        : t('duration.hoursMinutes', { hours, minutes: rest })
+    }
+
+    /** When the panel entered red, so the caption can show how long it has waited. */
+    let redSince = 0
+
+    function noteRedSince(state) {
+      if (state === 'red') {
+        if (redSince === 0) redSince = Date.now()
+      } else {
+        redSince = 0
+      }
+    }
+
+    /** Re-render every 15 s while red so the elapsed text stays honest. */
+    function useRedElapsed(state) {
+      const [, bump] = React.useState(0)
+      const active = state === 'red'
+      React.useEffect(() => {
+        if (!active) return undefined
+        const timer = window.setInterval(() => bump((value) => value + 1), 15000)
+        return () => window.clearInterval(timer)
+      }, [active])
+      if (!active || redSince === 0) return 0
+      return Date.now() - redSince
     }
 
     const LAMP_ORDER = ['red', 'amber', 'green']
@@ -808,15 +953,32 @@ registerModule({
     function FooterControl(props) {
       const t = safeTranslate(props.t)
       const { options, summary } = useSummary(props.useSessionStatus)
+      const elapsed = useRedElapsed(summary.state)
+
+      React.useEffect(() => {
+        noteRedSince(summary.state)
+      }, [summary.state])
 
       if (!options.enabled) return null
 
       const stateLabel = t(`state.${summary.state}`)
-      const tooltip = t('tooltip', {
-        running: summary.running,
-        waiting: summary.waiting,
-        total: summary.total,
-      })
+      const parts = [
+        t('tooltip', {
+          running: summary.running,
+          waiting: summary.waiting,
+          total: summary.total,
+        }),
+      ]
+      const kinds = kindsSummary(summary.kinds, t)
+      const waited = formatDuration(elapsed, t)
+      if (summary.waiting > 0 && waited !== '') {
+        parts.push(t('tooltip.waited', { time: waited }))
+      }
+      if (kinds !== '') parts.push(t('tooltip.kinds', { kinds }))
+      if (summary.completed > 0) {
+        parts.push(t('tooltip.completed', { count: summary.completed }))
+      }
+      const tooltip = parts.join(' · ')
       const children = [h(LampRow, { key: 'lamps', state: summary.state })]
       if (options.showLabel && props.wide === true) {
         children.push(
@@ -860,6 +1022,7 @@ registerModule({
       const previous = React.useRef(null)
 
       React.useEffect(() => {
+        noteRedSince(summary.state)
         const last = previous.current
         previous.current = { state: summary.state, waiting: summary.waiting }
         if (last === null || !options.beep) return
@@ -894,6 +1057,7 @@ registerModule({
      */
     function BoardReporter(props) {
       const { options, summary } = useSummary(props.useSessionStatus)
+      const board = useBoardInfo()
       const enabled = options.boardEnabled
 
       React.useEffect(() => {
@@ -904,9 +1068,11 @@ registerModule({
         return () => window.clearTimeout(timer)
       }, [
         enabled,
+        board.hostLabel,
         summary.state,
         summary.running,
         summary.waiting,
+        summary.completed,
         options.boardBase,
         options.boardSharecode,
         options.boardKey,
@@ -1075,6 +1241,18 @@ registerModule({
       }, [resetDone])
 
       const stateLabel = t(`state.${summary.state}`)
+      const elapsed = useRedElapsed(summary.state)
+      const waitingKinds = kindsSummary(summary.kinds, t)
+      const previewParts = []
+      const waitedText = formatDuration(elapsed, t)
+      if (summary.waiting > 0 && waitedText !== '') {
+        previewParts.push(t('tooltip.waited', { time: waitedText }))
+      }
+      if (waitingKinds !== '') previewParts.push(t('tooltip.kinds', { kinds: waitingKinds }))
+      if (summary.completed > 0) {
+        previewParts.push(t('tooltip.completed', { count: summary.completed }))
+      }
+      const previewDetail = previewParts.join(' · ')
       const boardStatus = !options.boardEnabled
         ? t('board.disabled')
         : board.status === 'connecting'
@@ -1135,6 +1313,13 @@ registerModule({
                 total: summary.total,
               }),
             ),
+            previewDetail === ''
+              ? null
+              : h(
+                  'span',
+                  { className: 'dsh-traffic-light-preview__counts' },
+                  previewDetail,
+                ),
           ),
         ),
         h(
@@ -1298,7 +1483,9 @@ registerModule({
             h(TextField, {
               label: t('option.boardName'),
               value: options.boardName,
-              placeholder: 'DSH',
+              placeholder: t('option.boardName.auto', {
+                name: board.hostLabel === '' ? 'DSH' : board.hostLabel,
+              }),
               onChange: (value) => writeOptions({ boardName: value }),
             }),
           ),
@@ -1471,6 +1658,17 @@ registerModule({
       'state.red': '等待选择',
       'state.yellow': '空闲',
       tooltip: '运行中 {running} · 等待选择 {waiting} · 会话共 {total}',
+      'tooltip.waited': '已等 {time}',
+      'tooltip.kinds': '等待{kinds}',
+      'tooltip.completed': '刚完成 {count} 个',
+      'kind.approval': '审批',
+      'kind.question': '提问',
+      'kind.plan': '计划确认',
+      'kind.other': '操作',
+      'duration.justNow': '刚刚',
+      'duration.minutes': '{count} 分钟',
+      'duration.hours': '{count} 小时',
+      'duration.hoursMinutes': '{hours} 小时 {minutes} 分钟',
       'preview.title': '当前状态',
       'preview.counts': '运行中 {running} · 等待选择 {waiting} · 会话共 {total}',
       'legend.green': '绿色：会话正在运行',
@@ -1512,7 +1710,9 @@ registerModule({
       'option.board.hint':
         '把左下角的灯色同步到公网看板：绿=运行中、黄=空闲、红=等你操作。第一次开启会自动注册本机设备并认领通道。',
       'option.boardName': '看板设备名',
-      'option.boardName.hint': '看板上显示的名字，也是注册设备时用的名字，最多 24 字。',
+      'option.boardName.hint':
+        '看板上显示的名字，也是注册设备时用的名字，最多 24 字；留空则用本机名。',
+      'option.boardName.auto': '留空用本机名（{name}）',
       'option.boardBase': '看板地址',
       'option.boardBase.hint': '接口根地址，一般保持默认。',
       'option.boardSharecode': 'sharecode',
@@ -1545,6 +1745,17 @@ registerModule({
       'state.red': 'Waiting',
       'state.yellow': 'Idle',
       tooltip: 'Running {running} · Waiting {waiting} · Sessions {total}',
+      'tooltip.waited': 'waiting {time}',
+      'tooltip.kinds': 'waiting for {kinds}',
+      'tooltip.completed': '{count} just finished',
+      'kind.approval': 'approval',
+      'kind.question': 'a question',
+      'kind.plan': 'plan review',
+      'kind.other': 'you',
+      'duration.justNow': 'a moment',
+      'duration.minutes': '{count} min',
+      'duration.hours': '{count} h',
+      'duration.hoursMinutes': '{hours} h {minutes} min',
       'preview.title': 'Current state',
       'preview.counts': 'Running {running} · Waiting {waiting} · Sessions {total}',
       'legend.green': 'Green: sessions are running',
@@ -1589,7 +1800,8 @@ registerModule({
         'Mirrors the lamps to the public board: green = running, amber = idle, red = waiting for you. Turning it on registers this machine and claims a channel once.',
       'option.boardName': 'Board device name',
       'option.boardName.hint':
-        'Shown on the board and used when registering the device; up to 24 characters.',
+        'Shown on the board and used when registering the device, up to 24 characters; leave empty to use this machine’s name.',
+      'option.boardName.auto': 'Empty uses this machine ({name})',
       'option.boardBase': 'Board URL',
       'option.boardBase.hint': 'API root; the default is usually right.',
       'option.boardSharecode': 'sharecode',
@@ -1651,6 +1863,10 @@ registerModule({
           window.removeEventListener('keydown', unlockAudio, true)
         }
       }, 'traffic-light: window listeners')
+
+      ctx.effect(() => {
+        void loadHostLabel()
+      }, 'traffic-light: host label')
 
       ctx.slots.inject('shell.overlay', () =>
         ctx.slots.register(

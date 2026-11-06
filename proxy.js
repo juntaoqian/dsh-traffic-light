@@ -9,12 +9,15 @@
  * posts `{ url, headers }` to this same-origin route and Node performs the
  * real request.
  *
- * The proxy is deliberately narrow: POST only, loopback callers only, `https`
- * targets under `app.workbuddy.host` only, and only the two board headers are
- * forwarded. It cannot be used as a general relay.
+ * The proxy is deliberately narrow: loopback callers only, `https` targets under
+ * `app.workbuddy.host` only, and only the two board headers are forwarded. It
+ * cannot be used as a general relay. A second, read-only route (`/info`) reports
+ * this machine's name so the client can label its channel by default.
  *
  * @module proxy
  */
+
+import { hostname } from 'node:os'
 
 /** Route registered on the DSH web server. */
 export const PROXY_PATH = '/dsh-traffic-light/api/board'
@@ -127,6 +130,23 @@ export function createBoardProxy(options = {}) {
     const url = new URL(request.url ?? '/', 'http://traffic-light.invalid')
     const suffix = url.pathname.startsWith(PROXY_PATH) ? url.pathname.slice(PROXY_PATH.length) : url.pathname
 
+    if (!isLoopback(request.socket?.remoteAddress)) {
+      sendJson(response, 403, { ok: false, error: '只允许本机访问', status: 0 })
+      return
+    }
+
+    // `/info` publishes this machine's name so the client can label its board
+    // channel without asking the user to invent one.
+    if (suffix === '/info') {
+      if ((request.method ?? 'GET').toUpperCase() !== 'GET') {
+        response.setHeader('allow', 'GET')
+        sendJson(response, 405, { ok: false, error: '只支持 GET', status: 0 })
+        return
+      }
+      sendJson(response, 200, { ok: true, hostname: hostname(), platform: process.platform })
+      return
+    }
+
     if (suffix !== '/report') {
       sendJson(response, 404, { ok: false, error: '接口不存在', status: 0 })
       return
@@ -134,10 +154,6 @@ export function createBoardProxy(options = {}) {
     if ((request.method ?? 'GET').toUpperCase() !== 'POST') {
       response.setHeader('allow', 'POST')
       sendJson(response, 405, { ok: false, error: '只支持 POST', status: 0 })
-      return
-    }
-    if (!isLoopback(request.socket?.remoteAddress)) {
-      sendJson(response, 403, { ok: false, error: '只允许本机访问', status: 0 })
       return
     }
 

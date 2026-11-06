@@ -51,6 +51,22 @@
 - 页面刚打开时如果已经是红/黄，不会补响（只对变化响应）。
 - 浏览器要求一次用户手势才能播放声音：点一下页面任意位置/按键之后即解锁，之后后台切换也会响。
 
+### 灯旁边和提示语里显示什么
+
+鼠标悬停（`title`）与设置页预览会拼出一行：
+
+```
+运行中 1 · 等待选择 1 · 会话共 3 · 等待审批 · 刚完成 1 个
+```
+
+| 片段 | 来源 | 说明 |
+| --- | --- | --- |
+| `等待{审批/提问/计划确认/操作}` | `pendingInteraction.kind` | 只知道"在等"不够，这里说清在等哪一种选择；无法识别的类型归为「操作」 |
+| `已等 N 分钟` | 插件自己打点 | 进入红灯起计时，超 1 分钟才显示；红灯期间每 15 秒刷新一次 |
+| `刚完成 N 个` | `completionUnread` | 跑完但还没看的会话数，绿灯/黄灯时也有意义 |
+
+会话标题、工作目录这类信息**只在本机可见的地方出现**（当前版本没有用），不会进公网看板。
+
 ## 📦 安装
 
 前置：[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（桌面版或 `dsh web`）。本插件依赖 DSH 的 Client slot 机制，没有其他 npm 依赖。
@@ -145,11 +161,13 @@ DSH 在安装 Git 仓库前会先用 `git ls-remote` 做一次连通性检查（
 
 | 本地灯 | 上报 `status` | 看板表现 | 文案示例 |
 | --- | --- | --- | --- |
-| 🟢 运行中 | `ok` | 绿灯常亮 | `DSH：会话正在运行` / `DSH：3 个会话运行中` |
-| 🟡 空闲 | `idle` | 黄灯常亮 | `DSH：没有会话在运行` |
-| 🔴 等待选择 | `action` | 红灯 + 闪烁 + 蜂鸣 | `DSH：有会话在等你选择` |
+| 🟢 运行中 | `ok` | 绿灯常亮 | `CXQJT：会话正在运行` / `CXQJT：3 个会话运行中` |
+| 🟡 空闲 | `idle` | 黄灯常亮 | `CXQJT：没有会话在运行` |
+| 🔴 等待选择 | `action` | 红灯 + 闪烁 + 蜂鸣 | `CXQJT：等你审批（已等 3 分钟）` / `CXQJT：2 个会话等你处理（审批 / 提问）（刚刚）` |
 
-`DSH` 就是「看板设备名」：改它等于改看板上的标签，多台机器起不同名字即可区分。
+开头的 `CXQJT` 是本机名（「看板设备名」留空时自动取 `os.hostname()`），多台机器不用手填也能区分；填了就用你填的。
+
+红色那行会带上**在等哪一种选择**和**已经等了多久**——远端看板的人最想知道这两件事。文案里不含会话标题、工作目录、prompt 摘要：看板是公开可读的。
 
 ### 设置项
 
@@ -158,11 +176,11 @@ DSH 在安装 Git 仓库前会先用 `git ls-remote` 做一次连通性检查（
 | 设置项 | 默认 | 说明 |
 | --- | --- | --- |
 | 上报状态到看板 | 关 | 打开后同步灯色；第一次开启自动注册设备并认领通道 |
-| 看板设备名 | `DSH` | 看板上显示的名字，也是注册 / 认领用的名字，≤24 字 |
+| 看板设备名 | 留空 = 本机名 | 看板上显示的名字，也是注册 / 认领用的名字，≤24 字 |
 | 看板地址 | 部署默认值 | 接口根地址，一般不用改 |
 | sharecode | 部署默认值 | 平台链接校验，漏了所有请求 403 |
 | 写权限 key | 部署默认值 | 全局写权限密码，等同密码 |
-| 同步提示词文本 | 开 | 是否连「几个会话在跑」的文案一起上报 |
+| 同步提示词文本 | 开 | 是否连「几个会话在跑 / 等你审批」的文案一起上报 |
 
 ### 行为细节
 
@@ -170,7 +188,7 @@ DSH 在安装 Git 仓库前会先用 `git ls-remote` 做一次连通性检查（
 - 首次开启依次调用 `POST /api/device/register` → 用返回的 `secret` 换 `code` → `POST /api/claim` 认领通道；`deviceId / secret / code / channel` 存进 `localStorage` 的 `dsh.traffic-light.board.v1`。
 - 写状态时 `sharecode / channel / status / label / text / duration` 全部放 **URL 查询串**，`X-Control-Key` / `X-Control-Code` 放请求头（不进访问日志）。
 - 通道在服务端消失（404）时会用 `deviceId + secret` 取回控制码、重新认领一次再重试。
-- 请求由 **Host 半边**（Node）经同源代理 `/dsh-traffic-light/api/board/report` 发出，渲染进程的 CSP / 跨域都挡不住；代理不可用时自动回退浏览器直连。
+- 请求由 **Host 半边**（Node）经同源代理 `/dsh-traffic-light/api/board/report` 发出，渲染进程的 CSP / 跨域都挡不住；代理不可用时自动回退浏览器直连。本机名走同一侧的同源路由 `/dsh-traffic-light/api/board/info`（只允许本机访问）。
 - 没有心跳：关掉页面后看板停在最后一次状态（避免多余请求与限流）。
 
 > ⚠️ **实测部署实例只认查询串**：`/api/set` 的 JSON body 与表单 body 会被静默忽略（返回 `applied: []` 且写入落到 `default` 通道），与接入文档「三种传参方式」的说法不一致。插件因此只用查询串，body 保持为空。
@@ -258,6 +276,10 @@ A traffic-light status control at the DeepSeek Harness Web UI sidebar foot.
 `git+https://github.com/juntaoqian/dsh-traffic-light.git`, then enable the bundle.
 
 **Configure:** **Settings → Traffic light** (show/hide, beep on/off, idle beep, 6 tones, volume, length, repeat count, green rule, label, waiting badge).
+
+**Caption:** the hover text names what is blocking you (approval / question / plan review), how long it has waited and how many sessions finished unread.
+
+**Public board (optional):** the same verdict can be pushed to a public AI status board. Turn on **Report status to the board** and it registers this machine, claims a channel, then mirrors the lamps: green → `ok`, amber → `idle`, red → `action` (red + blink + beep). The device label defaults to this machine's hostname; the caption says what it is waiting for and for how long. Credentials live in `localStorage`; writes go through the query string because the deployed service ignores request bodies.
 
 **Public board (optional):** the same verdict can be pushed to a public AI status board. Turn on **Report status to the board**, set a **device name**, and the plugin registers this machine, claims a channel, then mirrors the lamps: green → `ok`, amber → `idle`, red → `action` (red + blink + beep). Credentials live in `localStorage`; writes go through the query string because the deployed service ignores request bodies.
 
