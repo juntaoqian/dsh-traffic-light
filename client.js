@@ -1,22 +1,60 @@
 /**
  * Browser half of the traffic-light bundle.
  *
- * Two seats:
+ * Three seats:
  *  - `sidebar.footer.action` (bottom-left of the window, beside Settings) draws
  *    the red/amber/green lamp summarizing every session's state.
  *  - `settings.section` renders one Settings page that edits the persisted
  *    options; the footer control subscribes to the same store, so a change is
  *    live without a reload.
+ *  - `shell.overlay` holds two headless components: the beeper and the board
+ *    reporter, both of which must keep working while the foot is hidden.
  *
  * Session state comes only from the standard slot hooks the host passes in
  * (`useSessionStatus` / `useSessions`); the plugin never subscribes to session
  * events itself. Colors come from `--dsw-alias-*` theme tokens, so the control
  * follows light/dark themes.
  *
+ * The same verdict is optionally pushed to a public status board: the browser
+ * asks this plugin's Host half (same-origin route) to perform the write, so a
+ * `connect-src` CSP or a `dsh-app://` document origin cannot block it.
+ *
  * Plain JavaScript for the lazy factory form: `window.__ModuleLoader__.load`
  * registers the factory, and the module body runs at materialization.
  */
-window.__ModuleLoader__.load({
+
+/**
+ * Register the bundle factory at most once per document.
+ *
+ * DSH inlines `immediately` bundles into the boot payload and can execute the
+ * same file again later (an HMR revision replay, or a batch vs. one-resource
+ * URL overlap). `client-modules` rejects the second `load()` for one id with
+ * "duplicate factory registration", and that throw takes the whole plugin row
+ * down — the lamp and the settings page simply disappear.
+ *
+ * A `try`/`catch` is not enough: when `__ModuleLoader__` is not ready yet,
+ * `load()` only queues the registration and the loader replays the queue
+ * itself, where the duplicate throws outside this file. So the second
+ * execution must not call `load()` at all. The cost is that a hot reload of
+ * this bundle is ignored until the page is reloaded, which is fine: DSH's own
+ * loader states that a bundle must not execute twice without an invalidate.
+ *
+ * @param {{id: string, factory: Function}} definition bundle definition.
+ * @returns {void}
+ */
+function registerModule(definition) {
+  const REGISTERED_FLAG = '__dshTrafficLightModuleRegistered'
+
+  if (window[REGISTERED_FLAG] === true) return
+  window[REGISTERED_FLAG] = true
+  try {
+    window.__ModuleLoader__.load(definition)
+  } catch (error) {
+    // Already registered by the earlier execution: nothing to do.
+  }
+}
+
+registerModule({
   id: '@local/dsh-traffic-light',
   factory(require) {
     const React = require('react')
@@ -28,6 +66,22 @@ window.__ModuleLoader__.load({
     const PLUGIN_ID = '@local/dsh-traffic-light'
     /** Where the options live in this browser profile. */
     const STORAGE_KEY = 'dsh.traffic-light.options.v1'
+    /** Where the board credentials live (device secret included, options excluded). */
+    const REMOTE_KEY = 'dsh.traffic-light.board.v1'
+
+    /** Public AI status board this plugin reports to; see the integration doc. */
+    const BOARD_BASE = 'https://traffic-light-control-97708.app.workbuddy.host'
+    const BOARD_SHARECODE = '3R6XRRCJN6'
+    const BOARD_KEY = ''
+
+    /** Board endpoints. */
+    const API_REGISTER = '/api/device/register'
+    const API_RECOVER = '/api/device/recover'
+    const API_CLAIM = '/api/claim'
+    const API_SET = '/api/set'
+
+    /** Same-origin route the Host half mounts to perform the real request. */
+    const BOARD_PROXY = '/dsh-traffic-light/api/board/report'
 
     /** Selectable alert timbres; the first one is the fallback. */
     const SOUND_KEYS = ['classic', 'chime', 'ping', 'alert', 'deep', 'rise']
@@ -43,6 +97,12 @@ window.__ModuleLoader__.load({
       greenMode: 'any',
       showLabel: true,
       showCount: true,
+      boardEnabled: false,
+      boardBase: BOARD_BASE,
+      boardSharecode: BOARD_SHARECODE,
+      boardKey: BOARD_KEY,
+      boardName: 'DSH',
+      boardText: true,
     })
 
     // ---------------------------------------------------------------------
@@ -56,6 +116,14 @@ window.__ModuleLoader__.load({
       const parsed = typeof value === 'number' ? value : Number(value)
       if (!Number.isFinite(parsed)) return fallback
       return Math.min(max, Math.max(min, parsed))
+    }
+
+    /** Trimmed, length-capped string option; an empty value falls back. */
+    function textOption(value, fallback, maxLength) {
+      if (typeof value !== 'string') return fallback
+      const trimmed = value.trim()
+      if (trimmed === '') return fallback
+      return trimmed.slice(0, maxLength)
     }
 
     function normalizeOptions(raw) {
@@ -73,6 +141,12 @@ window.__ModuleLoader__.load({
         greenMode: source.greenMode === 'all' ? 'all' : 'any',
         showLabel: source.showLabel !== false,
         showCount: source.showCount !== false,
+        boardEnabled: source.boardEnabled === true,
+        boardBase: textOption(source.boardBase, DEFAULT_OPTIONS.boardBase, 300),
+        boardSharecode: textOption(source.boardSharecode, DEFAULT_OPTIONS.boardSharecode, 64),
+        boardKey: textOption(source.boardKey, DEFAULT_OPTIONS.boardKey, 128),
+        boardName: textOption(source.boardName, DEFAULT_OPTIONS.boardName, 24),
+        boardText: source.boardText !== false,
       }
     }
 
@@ -247,6 +321,410 @@ window.__ModuleLoader__.load({
     }
 
     // ---------------------------------------------------------------------
+    // Board sync: push the same red/amber/green verdict to the public board
+    //
+    // The board API needs two proofs per write: the shared control key (an
+    // operator password) and a per-device control code (`code`). Neither is
+    // known up front, so the first write registers a device, keeps the secret
+    // it returns, claims a channel for that code, and stores all four values
+    // in `localStorage`. Every later write reuses them; a lost code can be
+    // recovered from `deviceId + secret` without resetting the device.
+    // ---------------------------------------------------------------------
+
+    function loadBoardInfo() {
+      let raw = null
+      try {
+        const stored = window.localStorage.getItem(REMOTE_KEY)
+        if (stored) raw = JSON.parse(stored)
+      } catch (error) {
+        raw = null
+      }
+      const source = raw !== null && typeof raw === 'object' ? raw : {}
+      const channel = typeof source.channel === 'string' ? source.channel : ''
+      return {
+        deviceId: typeof source.deviceId === 'string' ? source.deviceId : '',
+        secret: typeof source.secret === 'string' ? source.secret : '',
+        code: typeof source.code === 'string' ? source.code : '',
+        channel,
+        status: channel === '' ? 'idle' : 'ready',
+        message: '',
+        at: 0,
+      }
+    }
+
+    function persistBoardInfo(info) {
+      try {
+        window.localStorage.setItem(
+          REMOTE_KEY,
+          JSON.stringify({
+            deviceId: info.deviceId,
+            secret: info.secret,
+            code: info.code,
+            channel: info.channel,
+          }),
+        )
+      } catch (error) {
+        // A private-mode profile cannot persist; the session still reports.
+      }
+    }
+
+    let boardInfo = loadBoardInfo()
+    const boardListeners = new Set()
+
+    function setBoardInfo(patch) {
+      boardInfo = { ...boardInfo, ...patch, at: Date.now() }
+      persistBoardInfo(boardInfo)
+      for (const listener of [...boardListeners]) {
+        try {
+          listener()
+        } catch (error) {
+          // One bad subscriber must not stop the others.
+        }
+      }
+    }
+
+    function subscribeBoard(listener) {
+      boardListeners.add(listener)
+      return () => {
+        boardListeners.delete(listener)
+      }
+    }
+
+    function readBoardInfo() {
+      return boardInfo
+    }
+
+    function useBoardInfo() {
+      return React.useSyncExternalStore(subscribeBoard, readBoardInfo, readBoardInfo)
+    }
+
+    /** `dsh-` plus 12 hex chars: ≥6 chars, lowercase a-z/0-9, stable per browser. */
+    function newDeviceId() {
+      const bytes = new Uint8Array(6)
+      const cryptoApi = window.crypto
+      if (cryptoApi && typeof cryptoApi.getRandomValues === 'function') {
+        cryptoApi.getRandomValues(bytes)
+      } else {
+        for (let index = 0; index < bytes.length; index += 1) {
+          bytes[index] = Math.floor(Math.random() * 256)
+        }
+      }
+      let hex = ''
+      for (const byte of bytes) hex += byte.toString(16).padStart(2, '0')
+      return `dsh-${hex}`
+    }
+
+    function readBoardName(options) {
+      const name = typeof options.boardName === 'string' ? options.boardName.trim() : ''
+      return (name === '' ? DEFAULT_OPTIONS.boardName : name).slice(0, 24)
+    }
+
+    /** Build one API URL; `sharecode` rides on every request and is never omitted. */
+    function boardUrl(options, path, query) {
+      const base = String(options.boardBase || '').replace(/\/+$/, '')
+      const url = new URL(base + path)
+      url.searchParams.set('sharecode', options.boardSharecode)
+      const params = query === undefined ? {} : query
+      for (const name of Object.keys(params)) {
+        const value = params[name]
+        if (value === undefined || value === null || value === '') continue
+        url.searchParams.set(name, String(value))
+      }
+      return url.toString()
+    }
+
+    /** Parse one board reply, turning a non-2xx or `{ok:false}` into an Error. */
+    async function boardResponse(response) {
+      let data = null
+      try {
+        data = await response.json()
+      } catch (error) {
+        data = null
+      }
+      if (!response.ok || (data !== null && data.ok === false)) {
+        const detail =
+          data !== null && typeof data === 'object' && (data.error || data.message)
+            ? String(data.error || data.message)
+            : `HTTP ${response.status}`
+        const failure = new Error(detail)
+        failure.status = response.status
+        throw failure
+      }
+      return data !== null && typeof data === 'object' ? data : {}
+    }
+
+    /** Why the last Host-proxy attempt gave up, for the error line in Settings. */
+    let lastProxyFailure = ''
+
+    /**
+     * Perform the write through this plugin's Host half.
+     *
+     * The Host process reaches the board even when the renderer cannot (CSP
+     * `connect-src`, a `file:`/custom document origin the board's CORS never
+     * answers, or a renderer network policy). Returns `null` when the route is
+     * not mounted, so the caller falls back to a direct `fetch`.
+     */
+    async function boardRequestViaHost(url, init) {
+      let response
+      try {
+        response = await fetch(BOARD_PROXY, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url,
+            method: (init && init.method) || 'POST',
+            headers: (init && init.headers) || {},
+          }),
+        })
+      } catch (error) {
+        lastProxyFailure = error && error.message ? String(error.message) : '无法访问代理路由'
+        return null
+      }
+      if (!response.ok) {
+        lastProxyFailure = `代理路由 HTTP ${response.status}`
+        return null
+      }
+      let envelope = null
+      try {
+        envelope = await response.json()
+      } catch (error) {
+        lastProxyFailure = '代理返回的不是 JSON'
+        return null
+      }
+      if (envelope === null || typeof envelope !== 'object') {
+        lastProxyFailure = '代理返回格式异常'
+        return null
+      }
+      if (envelope.ok !== true) {
+        const failure = new Error(
+          typeof envelope.error === 'string' ? envelope.error : '看板代理请求失败',
+        )
+        failure.status = typeof envelope.status === 'number' ? envelope.status : 0
+        throw failure
+      }
+      lastProxyFailure = ''
+      const status = typeof envelope.status === 'number' ? envelope.status : 0
+      const data = envelope.data
+      if (
+        status >= 200 &&
+        status < 300 &&
+        !(data !== null && typeof data === 'object' && data.ok === false)
+      ) {
+        return data !== null && typeof data === 'object' ? data : {}
+      }
+      const detail =
+        data !== null && typeof data === 'object' && (data.error || data.message)
+          ? String(data.error || data.message)
+          : `HTTP ${status}`
+      const failure = new Error(detail)
+      failure.status = status
+      throw failure
+    }
+
+    /** One board call: Host proxy first, browser `fetch` as the fallback. */
+    async function boardRequest(url, init) {
+      const proxied = await boardRequestViaHost(url, init)
+      if (proxied !== null) return proxied
+      return boardResponse(await fetch(url, init))
+    }
+
+    function describeBoardFailure(error) {
+      const status = error && typeof error.status === 'number' ? error.status : 0
+      const detail = error && error.message ? String(error.message) : ''
+      const proxyHint = lastProxyFailure === '' ? '' : `；代理失败：${lastProxyFailure}`
+      if (status === 0) {
+        // `fetch` reports CORS and offline with the same opaque TypeError.
+        return detail === '' || /failed to fetch|networkerror|load failed/i.test(detail)
+          ? `网络不可达，或被浏览器跨域策略拦截${proxyHint}`
+          : `${detail}${proxyHint}`
+      }
+      return `${detail === '' ? '请求失败' : detail}（HTTP ${status}）${proxyHint}`
+    }
+
+    let claimPromise = null
+
+    /** Register (once), recover the code if needed, then claim a channel. */
+    async function claimBoard(options) {
+      if (boardInfo.channel !== '' && boardInfo.code !== '') return
+      if (claimPromise !== null) return claimPromise
+      setBoardInfo({ status: 'connecting', message: '' })
+      claimPromise = (async () => {
+        const deviceId = boardInfo.deviceId === '' ? newDeviceId() : boardInfo.deviceId
+        const name = readBoardName(options)
+        let secret = boardInfo.secret
+        let code = boardInfo.code
+        let channel = ''
+
+        if (code === '' || secret === '') {
+          const registered = await boardRequest(
+            boardUrl(options, API_REGISTER, { deviceId, name }),
+            { method: 'POST' },
+          )
+          if (typeof registered.code === 'string' && registered.code !== '') {
+            code = registered.code
+            secret = typeof registered.secret === 'string' ? registered.secret : ''
+            channel = typeof registered.channel === 'string' ? registered.channel : ''
+          } else if (registered.exists === true || registered.created === false) {
+            if (secret === '') {
+              throw new Error('该设备 ID 已被注册且本机没有 secret，换一个设备名后重试')
+            }
+            const recovered = await boardRequest(
+              boardUrl(options, API_RECOVER, { deviceId, secret }),
+              { method: 'POST' },
+            )
+            code = typeof recovered.code === 'string' ? recovered.code : ''
+            channel = typeof recovered.channel === 'string' ? recovered.channel : ''
+          }
+          if (code === '') throw new Error('注册设备没有返回控制码')
+        }
+
+        if (channel === '') {
+          const claimed = await boardRequest(
+            boardUrl(options, API_CLAIM, { code, alias: name }),
+            { method: 'POST' },
+          )
+          channel = typeof claimed.channel === 'string' ? claimed.channel : ''
+        }
+        if (channel === '') throw new Error('认领通道没有返回通道 ID')
+
+        setBoardInfo({ deviceId, code, secret, channel, status: 'ready', message: '' })
+      })()
+      try {
+        await claimPromise
+      } catch (error) {
+        setBoardInfo({ status: 'error', message: describeBoardFailure(error) })
+        throw error
+      } finally {
+        claimPromise = null
+      }
+    }
+
+    /**
+     * Map the local verdict onto the board's semantic vocabulary.
+     * `action` is "waiting for a human" (red, beeping, blinking) and `ok` is
+     * "running", which is exactly what the sidebar lamps mean here.
+     */
+    function boardState(options, summary) {
+      const name = readBoardName(options)
+      if (summary.state === 'red') {
+        return {
+          status: 'action',
+          label: `${name}：需要你操作`.slice(0, 40),
+          text:
+            summary.waiting > 1
+              ? `${name}：${summary.waiting} 个会话等待选择`
+              : `${name}：有会话在等你选择`,
+        }
+      }
+      if (summary.state === 'green') {
+        return {
+          status: 'ok',
+          label: `${name}：运行中`.slice(0, 40),
+          text:
+            summary.running > 1
+              ? `${name}：${summary.running} 个会话运行中`
+              : `${name}：会话正在运行`,
+        }
+      }
+      return {
+        status: 'idle',
+        label: `${name}：空闲`.slice(0, 40),
+        text: `${name}：没有会话在运行`,
+      }
+    }
+
+    /**
+     * Write one state to the board.
+     *
+     * Every parameter rides in the query string: the deployed service silently
+     * ignores JSON and form bodies (`applied` comes back empty and the write
+     * lands on `default`), so the documented body form is unusable here. The
+     * key and the code still travel as headers, keeping them out of access logs.
+     */
+    async function postBoardState(options, state) {
+      const send = () =>
+        boardRequest(
+          boardUrl(options, API_SET, {
+            channel: boardInfo.channel,
+            status: state.status,
+            label: state.label,
+            duration: 0,
+            text: options.boardText ? state.text : '',
+          }),
+          {
+            method: 'POST',
+            headers: {
+              'X-Control-Key': options.boardKey,
+              'X-Control-Code': boardInfo.code,
+            },
+          },
+        )
+      try {
+        return await send()
+      } catch (error) {
+        if (!error || error.status !== 404) throw error
+        // The channel vanished server-side: keep the secret, recover the code,
+        // claim a fresh channel, and retry once.
+        setBoardInfo({ channel: '', code: '', status: 'idle', message: '' })
+        await claimBoard(options)
+        return await send()
+      }
+    }
+
+    /** Last payload actually accepted, so re-renders never re-post. */
+    let lastBoardState = ''
+    let reportPromise = null
+    let pendingBoardReport = null
+
+    /** Serialized writer: a state that arrives mid-flight is sent right after. */
+    async function drainBoardReports() {
+      try {
+        while (pendingBoardReport !== null) {
+          const job = pendingBoardReport
+          pendingBoardReport = null
+          if (job.key === lastBoardState) continue
+          await claimBoard(job.options)
+          await postBoardState(job.options, job.state)
+          lastBoardState = job.key
+          setBoardInfo({ status: 'ready', message: '' })
+        }
+      } catch (error) {
+        pendingBoardReport = null
+        setBoardInfo({ status: 'error', message: describeBoardFailure(error) })
+      } finally {
+        reportPromise = null
+      }
+    }
+
+    function reportBoard(options, summary) {
+      if (!options.boardEnabled) return Promise.resolve()
+      const state = boardState(options, summary)
+      const key = JSON.stringify(state)
+      if (key === lastBoardState) return Promise.resolve()
+      pendingBoardReport = { options, state, key }
+      if (reportPromise === null) reportPromise = drainBoardReports()
+      return reportPromise
+    }
+
+    /** Drop local credentials; the next report registers a brand-new device. */
+    function forgetBoard() {
+      lastBoardState = ''
+      setBoardInfo({
+        deviceId: '',
+        secret: '',
+        code: '',
+        channel: '',
+        status: 'idle',
+        message: '',
+      })
+    }
+
+    function boardPageUrl(options) {
+      const base = String(options.boardBase || '').replace(/\/+$/, '')
+      return `${base}/?sharecode=${encodeURIComponent(options.boardSharecode)}`
+    }
+
+    // ---------------------------------------------------------------------
     // Session state folding
     // ---------------------------------------------------------------------
 
@@ -407,6 +885,38 @@ window.__ModuleLoader__.load({
       return null
     }
 
+    /**
+     * Headless reporter in the frame-wide overlay.
+     *
+     * It has no markup of its own, so the board keeps hearing from the page
+     * even when the sidebar foot (and the lamps) are hidden. The 400 ms delay
+     * collapses a burst of status changes into one write.
+     */
+    function BoardReporter(props) {
+      const { options, summary } = useSummary(props.useSessionStatus)
+      const enabled = options.boardEnabled
+
+      React.useEffect(() => {
+        if (!enabled) return undefined
+        const timer = window.setTimeout(() => {
+          reportBoard(readOptions(), summary)
+        }, 400)
+        return () => window.clearTimeout(timer)
+      }, [
+        enabled,
+        summary.state,
+        summary.running,
+        summary.waiting,
+        options.boardBase,
+        options.boardSharecode,
+        options.boardKey,
+        options.boardName,
+        options.boardText,
+      ])
+
+      return null
+    }
+
     function Switch(props) {
       return h(
         'button',
@@ -506,6 +1016,39 @@ window.__ModuleLoader__.load({
       })
     }
 
+    /** A text input that commits on blur/Enter, so typing never re-renders the page. */
+    function TextField(props) {
+      const external = props.value
+      const [draft, setDraft] = React.useState(external)
+
+      React.useEffect(() => {
+        setDraft(external)
+      }, [external])
+
+      const commit = () => {
+        const next = draft.trim()
+        if (next !== external) props.onChange(next)
+      }
+
+      return h('input', {
+        type: props.type === undefined ? 'text' : props.type,
+        className: 'dsh-traffic-light-text',
+        'aria-label': props.label,
+        value: draft,
+        placeholder: props.placeholder,
+        spellCheck: false,
+        autoComplete: 'off',
+        onChange: (event) => setDraft(event.target.value),
+        onBlur: commit,
+        onKeyDown: (event) => {
+          if (event.key !== 'Enter') return
+          event.preventDefault()
+          commit()
+          event.currentTarget.blur()
+        },
+      })
+    }
+
     function Button(props) {
       return h(
         'button',
@@ -522,6 +1065,7 @@ window.__ModuleLoader__.load({
     function SettingsPage(props) {
       const t = safeTranslate(props.t)
       const { options, summary } = useSummary(props.useSessionStatus)
+      const board = useBoardInfo()
       const [resetDone, setResetDone] = React.useState(false)
 
       React.useEffect(() => {
@@ -531,6 +1075,28 @@ window.__ModuleLoader__.load({
       }, [resetDone])
 
       const stateLabel = t(`state.${summary.state}`)
+      const boardStatus = !options.boardEnabled
+        ? t('board.disabled')
+        : board.status === 'connecting'
+          ? t('board.connecting')
+          : board.status === 'error'
+            ? t('board.error', { message: board.message })
+            : board.channel !== ''
+              ? t('board.connected', { channel: board.channel })
+              : t('board.idle')
+
+      const connectBoard = () => {
+        writeOptions({ boardEnabled: true })
+        lastBoardState = ''
+        claimBoard(readOptions())
+          .then(() => reportBoard(readOptions(), summary))
+          .catch(() => {})
+      }
+
+      const submitBoard = () => {
+        lastBoardState = ''
+        reportBoard(readOptions(), summary).catch(() => {})
+      }
 
       return h(
         'div',
@@ -713,6 +1279,86 @@ window.__ModuleLoader__.load({
               onChange: (value) => writeOptions({ showCount: value }),
             }),
           ),
+          h('div', { className: 'dsh-traffic-light-group' }, t('group.board')),
+          h(
+            Row,
+            { label: t('option.board'), hint: t('option.board.hint') },
+            h(Switch, {
+              checked: options.boardEnabled,
+              label: t('option.board'),
+              onChange: (value) => {
+                writeOptions({ boardEnabled: value })
+                if (value) submitBoard()
+              },
+            }),
+          ),
+          h(
+            Row,
+            { label: t('option.boardName'), hint: t('option.boardName.hint') },
+            h(TextField, {
+              label: t('option.boardName'),
+              value: options.boardName,
+              placeholder: 'DSH',
+              onChange: (value) => writeOptions({ boardName: value }),
+            }),
+          ),
+          h(
+            Row,
+            { label: t('option.boardBase'), hint: t('option.boardBase.hint') },
+            h(TextField, {
+              label: t('option.boardBase'),
+              value: options.boardBase,
+              onChange: (value) => writeOptions({ boardBase: value }),
+            }),
+          ),
+          h(
+            Row,
+            { label: t('option.boardSharecode'), hint: t('option.boardSharecode.hint') },
+            h(TextField, {
+              label: t('option.boardSharecode'),
+              value: options.boardSharecode,
+              onChange: (value) => writeOptions({ boardSharecode: value }),
+            }),
+          ),
+          h(
+            Row,
+            { label: t('option.boardKey'), hint: t('option.boardKey.hint') },
+            h(TextField, {
+              label: t('option.boardKey'),
+              type: 'password',
+              value: options.boardKey,
+              onChange: (value) => writeOptions({ boardKey: value }),
+            }),
+          ),
+          h(
+            Row,
+            { label: t('option.boardText'), hint: t('option.boardText.hint') },
+            h(Switch, {
+              checked: options.boardText,
+              label: t('option.boardText'),
+              onChange: (value) => {
+                writeOptions({ boardText: value })
+                submitBoard()
+              },
+            }),
+          ),
+          h(
+            Row,
+            { label: t('board.state'), hint: boardStatus },
+            h(
+              'div',
+              { className: 'dsh-traffic-light-inline' },
+              h(Button, { label: t('action.board.connect'), onClick: connectBoard }),
+              h(Button, { label: t('action.board.report'), onClick: submitBoard }),
+              h(Button, {
+                label: t('action.board.forget'),
+                onClick: () => {
+                  forgetBoard()
+                  writeOptions({ boardEnabled: false })
+                },
+              }),
+            ),
+          ),
         ),
         h(
           'div',
@@ -731,6 +1377,16 @@ window.__ModuleLoader__.load({
           resetDone
             ? h('span', { className: 'dsh-traffic-light-reset' }, t('action.reset.done'))
             : null,
+          h(
+            'a',
+            {
+              className: 'dsh-traffic-light-link',
+              href: boardPageUrl(options),
+              target: '_blank',
+              rel: 'noreferrer noopener',
+            },
+            t('action.board.open'),
+          ),
         ),
       )
     }
@@ -793,6 +1449,12 @@ window.__ModuleLoader__.load({
 .dsh-traffic-light-button:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
 .dsh-traffic-light-actions{display:flex;align-items:center;gap:10px;padding-top:2px}
 .dsh-traffic-light-reset{font-size:12px;color:var(--dsw-alias-state-success-primary)}
+.dsh-traffic-light-group{margin:18px 0 2px;font-size:12px;font-weight:600;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+.dsh-traffic-light-text{width:240px;height:26px;padding:0 8px;box-sizing:border-box;border-radius:6px;border:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px}
+.dsh-traffic-light-text:hover{background:var(--dsw-alias-bg-layer-2)}
+.dsh-traffic-light-text:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.dsh-traffic-light-link{font-size:12px;line-height:20px;color:var(--dsw-alias-brand-primary);text-decoration:none}
+.dsh-traffic-light-link:hover{text-decoration:underline}
 @media (prefers-reduced-motion:reduce){.dsh-traffic-light__lamp--red[data-lit="true"]{animation:none}}
 `
 
@@ -845,6 +1507,31 @@ window.__ModuleLoader__.load({
       'action.testBeep': '试听音效',
       'action.reset': '恢复默认',
       'action.reset.done': '已恢复默认设置',
+      'group.board': '公网看板（AI 运行状态）',
+      'option.board': '上报状态到看板',
+      'option.board.hint':
+        '把左下角的灯色同步到公网看板：绿=运行中、黄=空闲、红=等你操作。第一次开启会自动注册本机设备并认领通道。',
+      'option.boardName': '看板设备名',
+      'option.boardName.hint': '看板上显示的名字，也是注册设备时用的名字，最多 24 字。',
+      'option.boardBase': '看板地址',
+      'option.boardBase.hint': '接口根地址，一般保持默认。',
+      'option.boardSharecode': 'sharecode',
+      'option.boardSharecode.hint': '平台链接校验参数，漏了所有请求都会 403。',
+      'option.boardKey': '写权限 key',
+      'option.boardKey.hint': '全局写权限密码，等于密码，不要外传。',
+      'option.boardText': '同步提示词文本',
+      'option.boardText.hint':
+        '连"几个会话在跑"这类文案一起上报；看板文案公开可读，别放敏感内容。',
+      'board.state': '连接状态',
+      'board.disabled': '未开启上报',
+      'board.idle': '尚未连接看板，点「连接看板」自动注册并认领通道',
+      'board.connecting': '正在连接看板…',
+      'board.connected': '已连接，通道 {channel}',
+      'board.error': '上报失败：{message}',
+      'action.board.connect': '连接看板',
+      'action.board.report': '立即上报',
+      'action.board.forget': '清除凭据',
+      'action.board.open': '打开看板',
       'unit.ms': '毫秒',
       'unit.times': '次',
     }
@@ -896,6 +1583,32 @@ window.__ModuleLoader__.load({
       'action.testBeep': 'Preview sound',
       'action.reset': 'Restore defaults',
       'action.reset.done': 'Defaults restored',
+      'group.board': 'Public board (AI status)',
+      'option.board': 'Report status to the board',
+      'option.board.hint':
+        'Mirrors the lamps to the public board: green = running, amber = idle, red = waiting for you. Turning it on registers this machine and claims a channel once.',
+      'option.boardName': 'Board device name',
+      'option.boardName.hint':
+        'Shown on the board and used when registering the device; up to 24 characters.',
+      'option.boardBase': 'Board URL',
+      'option.boardBase.hint': 'API root; the default is usually right.',
+      'option.boardSharecode': 'sharecode',
+      'option.boardSharecode.hint': 'Link validation token; every request 403s without it.',
+      'option.boardKey': 'Control key',
+      'option.boardKey.hint': 'Deployment-wide write password — treat it as a secret.',
+      'option.boardText': 'Sync the caption',
+      'option.boardText.hint':
+        'Also sends "how many sessions are running". The board is public: never put secrets there.',
+      'board.state': 'Connection',
+      'board.disabled': 'Reporting is off',
+      'board.idle': 'Not connected yet — press "Connect" to register and claim a channel',
+      'board.connecting': 'Connecting to the board…',
+      'board.connected': 'Connected, channel {channel}',
+      'board.error': 'Report failed: {message}',
+      'action.board.connect': 'Connect',
+      'action.board.report': 'Report now',
+      'action.board.forget': 'Forget credentials',
+      'action.board.open': 'Open the board',
       'unit.ms': 'ms',
       'unit.times': 'x',
     }
@@ -947,6 +1660,17 @@ window.__ModuleLoader__.load({
             order: 800,
           },
           StatusWatcher,
+        ),
+      )
+
+      ctx.slots.inject('shell.overlay', () =>
+        ctx.slots.register(
+          {
+            name: 'shell.overlay',
+            id: 'traffic-light-board',
+            order: 810,
+          },
+          BoardReporter,
         ),
       )
 

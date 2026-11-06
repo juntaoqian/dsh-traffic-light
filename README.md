@@ -8,6 +8,7 @@
 - 🟡 黄 = 没有会话在运行
 
 > 纯前端插件，无第三方 npm 依赖、无构建步骤、不需要文件/网络/工具权限；配色全部使用 DSH 主题 token，浅色/深色自动适配。
+> 可选把同样的结论上报到一块公网红绿灯看板（见「上报到公网看板」）。
 > 在 DSH `0.2.1-rc.5`（桌面版）上验证通过。
 
 ---
@@ -128,28 +129,89 @@ DSH 在安装 Git 仓库前会先用 `git ls-remote` 做一次连通性检查（
 
 设置保存在浏览器 `localStorage` 的 `dsh.traffic-light.options.v1`；同一页面的两个座位共享同一个 store，改动实时同步；多窗口之间通过 `storage` 事件同步。
 
+## 🌐 公网看板：怎么用
+
+一句话：让一块公网可见的看板显示这台机器**在跑、空闲，还是在等你操作**。
+
+### 三步开起来
+
+1. **打开开关** — Settings → 红绿灯 → 公网看板 → 打开「上报状态到看板」。
+2. **等状态行变化** — 首次开启会自动注册本机设备（`deviceId` 形如 `dsh-3f9a1c0be2d4`）并认领通道，状态行从「尚未连接看板」变成「已连接，通道 `ch-xxxxxx`」。
+3. **（可选）看一眼** — 点「打开看板」，带 `?sharecode=...` 的页面里能看到这条通道，灯色随本地灯变化。
+
+旁边的三个按钮就是手动版：「连接看板」= 重做第 2 步，「立即上报」= 无视去重立刻写一次，「清除凭据」= 丢掉本机保存的四个值，下次重新注册一台新设备。
+
+### 看板上会显示什么
+
+| 本地灯 | 上报 `status` | 看板表现 | 文案示例 |
+| --- | --- | --- | --- |
+| 🟢 运行中 | `ok` | 绿灯常亮 | `DSH：会话正在运行` / `DSH：3 个会话运行中` |
+| 🟡 空闲 | `idle` | 黄灯常亮 | `DSH：没有会话在运行` |
+| 🔴 等待选择 | `action` | 红灯 + 闪烁 + 蜂鸣 | `DSH：有会话在等你选择` |
+
+`DSH` 就是「看板设备名」：改它等于改看板上的标签，多台机器起不同名字即可区分。
+
+### 设置项
+
+**Settings → 红绿灯 → 公网看板**：
+
+| 设置项 | 默认 | 说明 |
+| --- | --- | --- |
+| 上报状态到看板 | 关 | 打开后同步灯色；第一次开启自动注册设备并认领通道 |
+| 看板设备名 | `DSH` | 看板上显示的名字，也是注册 / 认领用的名字，≤24 字 |
+| 看板地址 | 部署默认值 | 接口根地址，一般不用改 |
+| sharecode | 部署默认值 | 平台链接校验，漏了所有请求 403 |
+| 写权限 key | 部署默认值 | 全局写权限密码，等同密码 |
+| 同步提示词文本 | 开 | 是否连「几个会话在跑」的文案一起上报 |
+
+### 行为细节
+
+- 只在状态**真的变化**时上报：重复渲染、改设置都不会重复发请求（服务端也会合并同状态日志）。
+- 首次开启依次调用 `POST /api/device/register` → 用返回的 `secret` 换 `code` → `POST /api/claim` 认领通道；`deviceId / secret / code / channel` 存进 `localStorage` 的 `dsh.traffic-light.board.v1`。
+- 写状态时 `sharecode / channel / status / label / text / duration` 全部放 **URL 查询串**，`X-Control-Key` / `X-Control-Code` 放请求头（不进访问日志）。
+- 通道在服务端消失（404）时会用 `deviceId + secret` 取回控制码、重新认领一次再重试。
+- 请求由 **Host 半边**（Node）经同源代理 `/dsh-traffic-light/api/board/report` 发出，渲染进程的 CSP / 跨域都挡不住；代理不可用时自动回退浏览器直连。
+- 没有心跳：关掉页面后看板停在最后一次状态（避免多余请求与限流）。
+
+> ⚠️ **实测部署实例只认查询串**：`/api/set` 的 JSON body 与表单 body 会被静默忽略（返回 `applied: []` 且写入落到 `default` 通道），与接入文档「三种传参方式」的说法不一致。插件因此只用查询串，body 保持为空。
+
+## 🧰 排查常见现象
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| 插件整个消失（灯、设置页、Plugins 里都没有），且没有任何报错 | 安装副本的 `package.json` 与 Loader 行名不一致，DSH 静默跳过客户端条目 | 见「开发」最后一条：别用源码 `package.json` 覆盖安装副本 |
+| 状态行「网络不可达，或被浏览器跨域策略拦截」 | 渲染进程跑在 `dsh-app://`，直连 https 被 CORS 拦，而代理路由还没挂上 | 重启 DSH 让 Host 半边加载；错误行会附带「代理失败：…」的具体原因 |
+| 状态行「上报失败：HTTP 401」 | key 不对，或没带控制码 | 核对「写权限 key」；「清除凭据」后重连 |
+| 状态行「上报失败：HTTP 403」 | 少了 sharecode / 控制码无效 | 核对 sharecode，或用「清除凭据」重新注册 |
+| 状态行「上报失败：HTTP 429」 | 配额用尽，或失败过多被锁 10 分钟 | 别连续点「连接看板」，等 10 分钟 |
+| 看板永远是最后一次状态 | 没有心跳，页面关了没人再写 | 正常行为；要「关机即变黄」可自行加 keepalive 上报 |
+| 改了 `client.js` 没生效 | 防重入保护会忽略热更新 | 刷新页面；改了 Host 半边（`index.js` / `proxy.js`）则要重启 DSH |
+
 ## 🧩 工作原理（想改它的人看这里）
 
-三个座位（slots）：
+三个座位（slots），四个组件：
 
-| 座位 | 作用 |
-| --- | --- |
-| `sidebar.footer.action` | 左下角红绿灯本体 |
-| `settings.section` | Settings 里的配置页 |
-| `shell.overlay` | 无渲染的蜂鸣监听器（侧栏折叠/脚部被隐藏时仍然工作） |
+| 座位 | 组件 | 作用 |
+| --- | --- | --- |
+| `sidebar.footer.action` | `FooterControl` | 左下角红绿灯本体 |
+| `settings.section` | `SettingsPage` | Settings 里的配置页（含看板设置） |
+| `shell.overlay` | `StatusWatcher` | 无渲染的蜂鸣监听器（侧栏折叠/脚部被隐藏时仍然工作） |
+| `shell.overlay` | `BoardReporter` | 无渲染的上报器：状态变化后 400 ms 去抖写一次看板 |
 
 - **状态来源**：只用宿主通过 slot 传入的标准 hook `useSessionStatus(selector)`，返回值是 `Map<sessionId, { running, pendingInteraction, completionUnread }>`；`pendingInteraction` 非空就是"等待选择"。插件不订阅会话事件、不读 DOM、不扫描其他插件。
 - **样式**：只用 `--dsw-alias-*` 主题 token（`state-error-primary` / `state-warn-primary` / `state-success-primary` 等），`prefers-reduced-motion` 下关闭呼吸动画。
 - **蜂鸣**：Web Audio 合成（每个音符一条 `OscillatorNode` + `GainNode` 指数衰减包络），6 种音色在 `SOUND_PRESETS` 里各写几行音符即可新增。
-- **Host 半边为空**：`index.js` 只有 `export function apply() {}`，用于让 `dsh.client` 进入启动图；不注册任何 Host 服务、不写文件。
+- **上报**：`boardUrl()` 统一拼 `sharecode` 与参数，`boardRequest()` 先 POST 给 Host 半边的同源代理、失败再回退浏览器直连；代理侧 `createBoardProxy()` 只放行本机调用与 `*.app.workbuddy.host`，并把看板的 4xx 原样回传，客户端据此映射 401/403/404/429。`claimBoard()` 负责注册+取回+认领（并发用 `claimPromise` 合流），`drainBoardReports()` 串行发送并在失败时把状态改成 error 显示在设置页。
+- **Host 半边**：`index.js` 在 `ctx.webServer` 上挂一个 `prefix` 路由（与 `dsh-vars` 同样的做法），`proxy.js` 里是真正发请求的处理器；不写文件、不注册其他服务。
 
 ## 📁 文件结构
 
 ```
 package.json         # dsh.bundle + dsh.client 声明（名字、入口、加载顺序）
 cordis.patch.yml     # 插入名为 traffic-light 的 Loader 行
-index.js             # Host 半边（空）
-client.js            # 全部 UI / 状态 / 音效 / 设置（纯 JS，无构建产物）
+index.js             # Host 半边：把看板代理挂到 webServer
+proxy.js             # 代理处理器（本机限定 + 域名白名单 + 原样回传状态码）
+client.js            # 全部 UI / 状态 / 音效 / 设置 / 上报（纯 JS，无构建产物）
 locale/en.json       # Plugins 页面显示名（英文）
 locale/zh.json       # Plugins 页面显示名（中文）
 icon.svg             # 插件图标
@@ -162,13 +224,21 @@ LICENSE              # MIT
 - 语法自检：`node --check client.js`。
 - 改 `package.json` 的 `name` / `version` 属于"换包"，需要卸载重装。
 - 新增音效：在 `SOUND_PRESETS` 加一条 `名字(start, length, play)`，并在 `SOUND_KEYS`、两套语言字典里各加一项。
+- **不要用源码的 `package.json` 覆盖安装副本里的那份。** 安装副本（`profiles/<profile>/node_modules/@local/dsh-traffic-light`）的 `name` 会被安装器改写成安装别名 `@local/dsh-traffic-light`；DSH 用「Loader 行名 === package.json 的 name」定位客户端 bundle（`client-modules` 的 `nearestPackage`）。名字对不上时它**静默**跳过客户端条目：灯、设置页、插件图标一起消失，且不写任何错误日志。源码保留上游包名 `dsh-traffic-light` 即可，重装会重新改写。
 
 ## ⚠️ 已知限制
 
 - 红绿灯展示的是当前页面能看到的会话集合（与侧边栏会话列表一致，含子会话）。
-- Windows 标题栏模式下折叠侧边栏时，DSH 自身会隐藏侧栏脚部（Settings 同理），此时灯不可见；蜂鸣仍生效。
+- Windows 标题栏模式下折叠侧边栏时，DSH 自身会隐藏侧栏脚部（Settings 同理），此时灯不可见；蜂鸣与上报仍生效。
 - 浏览器自动播放策略：首次提示音需要页面先有一次点击/按键。
 - 依赖 DSH 的 slot / hook 名称（`sidebar.footer.action`、`settings.section`、`shell.overlay`、`useSessionStatus`）；DSH 大版本若调整这些接口，插件可能需要适配。
+- 看板没有心跳：关掉页面/退出 DSH 后，看板会停在最后一次状态（这样不会为"还活着吗"反复请求、也不会触发限流）。要看状态是否新鲜，看板上的「多久之前更新」即可。
+- `X-Control-Key` 与设备 `secret` 都存在浏览器 `localStorage`（`dsh.traffic-light.options.v1` / `dsh.traffic-light.board.v1`），共用电脑时注意。
+- 一台机器一个通道：同一浏览器多开窗口会共享同一台设备；多台机器请用不同的「看板设备名」。
+- 看板文案（`text` / `label`）公开可读，插件只写灯色与会话数量，不含会话标题等敏感内容。
+- **请求经由 Host 半边发出**：浏览器端只 POST 到同源路由 `/dsh-traffic-light/api/board/report`，由 DSH 的 Host 进程（Node）真正访问看板并原样回传状态码。这样 `connect-src` CSP、非 `http(s)` 页面来源、CORS 都不会再挡住上报；代理只允许本机调用、只允许 `https://*.app.workbuddy.host`、只转发两个控制头。若该路由不可用（旧版 DSH 或从局域网地址打开），客户端会自动回退成浏览器直连。
+- 改了 `index.js` / `proxy.js` 需要**重启 DSH** 才生效（Host 半边不热更新）；只改 `client.js` 刷新页面即可。
+- 公网看板有配额：注册设备 20 台/IP/小时、全局 300 台；新建通道 5 个/IP/小时。反复点「清除凭据」会不断注册新设备。
 
 ## 📄 License
 
@@ -188,6 +258,8 @@ A traffic-light status control at the DeepSeek Harness Web UI sidebar foot.
 `git+https://github.com/juntaoqian/dsh-traffic-light.git`, then enable the bundle.
 
 **Configure:** **Settings → Traffic light** (show/hide, beep on/off, idle beep, 6 tones, volume, length, repeat count, green rule, label, waiting badge).
+
+**Public board (optional):** the same verdict can be pushed to a public AI status board. Turn on **Report status to the board**, set a **device name**, and the plugin registers this machine, claims a channel, then mirrors the lamps: green → `ok`, amber → `idle`, red → `action` (red + blink + beep). Credentials live in `localStorage`; writes go through the query string because the deployed service ignores request bodies.
 
 No third-party dependencies, no build step, no Host permissions. UI copy is Chinese + English and follows the DSH locale. Tested on DSH `0.2.1-rc.5`.
 
