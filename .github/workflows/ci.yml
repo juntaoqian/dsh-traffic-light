@@ -1,0 +1,23 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: syntax check
+        run: |
+          for f in index.js proxy.js client.js; do node --check "$f"; done
+      - name: package manifest
+        run: |
+          node -e "const p=require('./package.json'); for (const k of ['name','version','exports','files']) if (!p[k]) throw new Error('missing '+k); console.log('ok', p.name, p.version)"
+      - name: locale json
+        run: |
+          for f in locale/*.json; do node -e "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'))" "$f"; done

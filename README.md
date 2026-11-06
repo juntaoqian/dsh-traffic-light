@@ -293,3 +293,14 @@ A traffic-light status control at the DeepSeek Harness Web UI sidebar foot.
 No third-party dependencies, no build step, no Host permissions. UI copy is Chinese + English and follows the DSH locale. Tested on DSH `0.2.1-rc.5`.
 
 MIT licensed. Screenshots welcome via PR.
+
+## 维护信息
+
+| 项 | 值 |
+| --- | --- |
+| 版本 | 1.4.0 |
+| 测试 | .github/workflows/ci.yml（push / PR） |
+| CI | 无单测（CI 做语法 / 清单 / locale 校验） |
+| 问题反馈 | https://github.com/juntaoqian/dsh-traffic-light/issues |
+| 源码 | https://github.com/juntaoqian/dsh-traffic-light |
+| 许可证 | MIT |

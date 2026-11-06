@@ -4,6 +4,10 @@
   "description": "DeepSeek Harness Web UI 左下角红绿灯：汇总所有会话的运行/等待状态，红灯/黄灯蜂鸣提醒，设置页可配置（含 6 种音效），可选把状态上报到公网看板。",
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.1-rc.2"
+  },
   "author": "juntaoqian",
   "homepage": "https://github.com/juntaoqian/dsh-traffic-light#readme",
   "repository": {
