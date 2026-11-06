@@ -847,8 +847,10 @@ registerModule({
       let completed = 0
       /** @type {Map<string, number>} */
       const kinds = new Map()
+      /** Session ids that are waiting for a choice, in map order. */
+      const waitingIds = []
       if (statuses && typeof statuses.forEach === 'function') {
-        statuses.forEach((status) => {
+        statuses.forEach((status, id) => {
           if (status === undefined || status === null) return
           total += 1
           if (status.running === true) running += 1
@@ -856,6 +858,7 @@ registerModule({
           const interaction = status.pendingInteraction
           if (interaction !== undefined && interaction !== null) {
             waiting += 1
+            if (typeof id === 'string') waitingIds.push(id)
             const kind = interactionKind(interaction)
             kinds.set(kind, (kinds.get(kind) || 0) + 1)
           }
@@ -865,7 +868,38 @@ registerModule({
       if (waiting > 0) state = 'red'
       else if (greenMode === 'all') state = total > 0 && running === total ? 'green' : 'yellow'
       else state = running > 0 ? 'green' : 'yellow'
-      return { state, total, running, waiting, completed, kinds }
+      return { state, total, running, waiting, completed, kinds, waitingIds }
+    }
+
+    /** The name a session shows in the sidebar: its title, else its id. */
+    function sessionTitle(sessions, id) {
+      if (sessions === null || sessions === undefined || sessions.byId === undefined) return ''
+      const row = sessions.byId[id]
+      if (row === null || row === undefined) return ''
+      const title =
+        typeof row.displayTitle === 'string' && row.displayTitle !== ''
+          ? row.displayTitle
+          : typeof row.title === 'string'
+            ? row.title
+            : ''
+      return title.trim()
+    }
+
+    /** `等待：修登录超时、升级依赖 等 3 个` — local-only, never sent to the board. */
+    function waitingTitlesText(waitingIds, sessions, t) {
+      const MAX_TITLES = 2
+      const titles = []
+      for (const id of waitingIds) {
+        const title = sessionTitle(sessions, id)
+        if (title === '') continue
+        titles.push(title.length > 18 ? `${title.slice(0, 18)}…` : title)
+        if (titles.length >= MAX_TITLES) break
+      }
+      if (titles.length === 0) return ''
+      const joined = titles.join('、')
+      return waitingIds.length > titles.length
+        ? t('tooltip.titlesMore', { titles: joined, count: waitingIds.length })
+        : t('tooltip.titles', { titles: joined })
     }
 
     /**
@@ -994,6 +1028,8 @@ registerModule({
       const t = safeTranslate(props.t)
       const { options, summary } = useSummary(props.useSessionStatus)
       const elapsed = useRedElapsed(summary.state)
+      const sessions =
+        typeof props.useSessions === 'function' ? props.useSessions((state) => state) : null
 
       React.useEffect(() => {
         noteRedSince(summary.state)
@@ -1009,6 +1045,8 @@ registerModule({
           total: summary.total,
         }),
       ]
+      const titles = waitingTitlesText(summary.waitingIds, sessions, t)
+      if (titles !== '') parts.push(titles)
       const kinds = kindsSummary(summary.kinds, t)
       const waited = formatDuration(elapsed, t)
       if (summary.waiting > 0 && waited !== '') {
@@ -1282,8 +1320,12 @@ registerModule({
 
       const stateLabel = t(`state.${summary.state}`)
       const elapsed = useRedElapsed(summary.state)
+      const sessions =
+        typeof props.useSessions === 'function' ? props.useSessions((state) => state) : null
       const waitingKinds = kindsSummary(summary.kinds, t)
       const previewParts = []
+      const previewTitles = waitingTitlesText(summary.waitingIds, sessions, t)
+      if (previewTitles !== '') previewParts.push(previewTitles)
       const waitedText = formatDuration(elapsed, t)
       if (summary.waiting > 0 && waitedText !== '') {
         previewParts.push(t('tooltip.waited', { time: waitedText }))
@@ -1701,6 +1743,8 @@ registerModule({
       'tooltip.waited': '已等 {time}',
       'tooltip.kinds': '等待{kinds}',
       'tooltip.completed': '刚完成 {count} 个',
+      'tooltip.titles': '等待：{titles}',
+      'tooltip.titlesMore': '等待：{titles} 等 {count} 个',
       'kind.approval': '审批',
       'kind.question': '提问',
       'kind.plan': '计划确认',
@@ -1788,6 +1832,8 @@ registerModule({
       'tooltip.waited': 'waiting {time}',
       'tooltip.kinds': 'waiting for {kinds}',
       'tooltip.completed': '{count} just finished',
+      'tooltip.titles': 'waiting: {titles}',
+      'tooltip.titlesMore': 'waiting: {titles} +{count}',
       'kind.approval': 'approval',
       'kind.question': 'a question',
       'kind.plan': 'plan review',
