@@ -152,11 +152,14 @@ DSH 在安装 Git 仓库前会先用 `git ls-remote` 做一次连通性检查（
 
 ### 三步开起来
 
-1. **打开开关** — Settings → 红绿灯 → 公网看板 → 打开「上报状态到看板」。
+0. **填写权限 key** — Settings → 红绿灯 → 公网看板 → 「写权限 key」，向看板部署方索取。**插件不自带这个值**：它是全局写权限密码，仓库是公开的，所以只存在你本机。
+1. **打开开关** — 同页打开「上报状态到看板」。
 2. **等状态行变化** — 首次开启会自动注册本机设备（`deviceId` 形如 `dsh-3f9a1c0be2d4`）并认领通道，状态行从「尚未连接看板」变成「已连接，通道 `ch-xxxxxx`」。
 3. **（可选）看一眼** — 点「打开看板」，带 `?sharecode=...` 的页面里能看到这条通道，灯色随本地灯变化。
 
-旁边的三个按钮就是手动版：「连接看板」= 重做第 2 步，「立即上报」= 无视去重立刻写一次，「清除凭据」= 丢掉本机保存的四个值，下次重新注册一台新设备。
+没填 key 时状态行会停在「请先填写写权限 key（向看板部署方索取）」，不会发出任何请求（避免 401 与失败计数）。
+
+旁边的三个按钮就是手动版：「连接看板」= 重做第 2 步，「立即上报」= 无视去重立刻写一次，「清除凭据」= 丢掉本机保存的四个值，下次重新注册一台新设备（key 不受影响）。
 
 ### 看板上会显示什么
 
@@ -180,7 +183,7 @@ DSH 在安装 Git 仓库前会先用 `git ls-remote` 做一次连通性检查（
 | 看板设备名 | 留空 = 本机名 | 看板上显示的名字，也是注册 / 认领用的名字，≤24 字 |
 | 看板地址 | 部署默认值 | 接口根地址，一般不用改 |
 | sharecode | 部署默认值 | 平台链接校验，漏了所有请求 403 |
-| 写权限 key | 部署默认值 | 全局写权限密码，等同密码 |
+| 写权限 key | **空（必填）** | 全局写权限密码，向部署方索取；只存本机 `localStorage`，插件不内置默认值 |
 | 同步提示词文本 | 开 | 是否连「几个会话在跑 / 等你审批」的文案一起上报 |
 
 ### 行为细节
@@ -201,6 +204,7 @@ DSH 在安装 Git 仓库前会先用 `git ls-remote` 做一次连通性检查（
 | --- | --- | --- |
 | 插件整个消失（灯、设置页、Plugins 里都没有），且没有任何报错 | 安装副本的 `package.json` 与 Loader 行名不一致，DSH 静默跳过客户端条目 | 见「开发」最后一条：别用源码 `package.json` 覆盖安装副本 |
 | 状态行「网络不可达，或被浏览器跨域策略拦截」 | 渲染进程跑在 `dsh-app://`，直连 https 被 CORS 拦，而代理路由还没挂上 | 重启 DSH 让 Host 半边加载；错误行会附带「代理失败：…」的具体原因 |
+| 状态行「请先填写写权限 key（向看板部署方索取）」 | 插件不自带 key，本机还没填 | 在「写权限 key」里填入部署方给的值，回车保存 |
 | 状态行「上报失败：HTTP 401」 | key 不对，或没带控制码 | 核对「写权限 key」；「清除凭据」后重连 |
 | 状态行「上报失败：HTTP 403」 | 少了 sharecode / 控制码无效 | 核对 sharecode，或用「清除凭据」重新注册 |
 | 状态行「上报失败：HTTP 429」 | 配额用尽，或失败过多被锁 10 分钟 | 别连续点「连接看板」，等 10 分钟 |
@@ -244,6 +248,7 @@ LICENSE              # MIT
 - 语法自检：`node --check client.js`。
 - 改 `package.json` 的 `name` / `version` 属于"换包"，需要卸载重装。
 - 新增音效：在 `SOUND_PRESETS` 加一条 `名字(start, length, play)`，并在 `SOUND_KEYS`、两套语言字典里各加一项。
+- **不要提交写权限 key。** `client.js` 里 `BOARD_KEY` 的默认值是空字符串，key 只从本机 `localStorage` 读取；调试时也不要把真实 key 写进代码或用 `-c` 传给 git。这个仓库是公开的，key 一旦进历史就很难真正清除。
 - **不要用源码的 `package.json` 覆盖安装副本里的那份。** 安装副本（`profiles/<profile>/node_modules/@local/dsh-traffic-light`）的 `name` 会被安装器改写成安装别名 `@local/dsh-traffic-light`；DSH 用「Loader 行名 === package.json 的 name」定位客户端 bundle（`client-modules` 的 `nearestPackage`）。名字对不上时它**静默**跳过客户端条目：灯、设置页、插件图标一起消失，且不写任何错误日志。源码保留上游包名 `dsh-traffic-light` 即可，重装会重新改写。
 
 ## ⚠️ 已知限制
@@ -253,7 +258,7 @@ LICENSE              # MIT
 - 浏览器自动播放策略：首次提示音需要页面先有一次点击/按键。
 - 依赖 DSH 的 slot / hook 名称（`sidebar.footer.action`、`settings.section`、`shell.overlay`、`useSessionStatus`）；DSH 大版本若调整这些接口，插件可能需要适配。
 - 看板没有心跳：关掉页面/退出 DSH 后，看板会停在最后一次状态（这样不会为"还活着吗"反复请求、也不会触发限流）。要看状态是否新鲜，看板上的「多久之前更新」即可。
-- `X-Control-Key` 与设备 `secret` 都存在浏览器 `localStorage`（`dsh.traffic-light.options.v1` / `dsh.traffic-light.board.v1`），共用电脑时注意。
+- `X-Control-Key` 与设备 `secret` 都存在浏览器 `localStorage`（`dsh.traffic-light.options.v1` / `dsh.traffic-light.board.v1`），共用电脑时注意。key 不在代码里，换机器要重新填一次。
 - 一台机器一个通道：同一浏览器多开窗口会共享同一台设备；多台机器请用不同的「看板设备名」。
 - 看板文案（`text` / `label`）公开可读，插件只写灯色与会话数量，不含会话标题等敏感内容。
 - **请求经由 Host 半边发出**：浏览器端只 POST 到同源路由 `/dsh-traffic-light/api/board/report`，由 DSH 的 Host 进程（Node）真正访问看板并原样回传状态码。这样 `connect-src` CSP、非 `http(s)` 页面来源、CORS 都不会再挡住上报；代理只允许本机调用、只允许 `https://*.app.workbuddy.host`、只转发两个控制头。若该路由不可用（旧版 DSH 或从局域网地址打开），客户端会自动回退成浏览器直连。

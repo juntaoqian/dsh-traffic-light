@@ -72,6 +72,11 @@ registerModule({
     /** Public AI status board this plugin reports to; see the integration doc. */
     const BOARD_BASE = 'https://traffic-light-control-97708.app.workbuddy.host'
     const BOARD_SHARECODE = '3R6XRRCJN6'
+    /**
+     * The deployment-wide write key is deliberately NOT shipped: it is a
+     * password, and this bundle lives in a public repository. Enter it once in
+     * Settings → 红绿灯 → 公网看板; it is stored in this browser only.
+     */
     const BOARD_KEY = ''
 
     /** Board endpoints. */
@@ -153,7 +158,7 @@ registerModule({
         boardEnabled: source.boardEnabled === true,
         boardBase: textOption(source.boardBase, DEFAULT_OPTIONS.boardBase, 300),
         boardSharecode: textOption(source.boardSharecode, DEFAULT_OPTIONS.boardSharecode, 64),
-        boardKey: textOption(source.boardKey, DEFAULT_OPTIONS.boardKey, 128),
+        boardKey: optionalText(source.boardKey, 128),
         boardName: optionalText(source.boardName, 24),
         boardText: source.boardText !== false,
       }
@@ -435,6 +440,11 @@ registerModule({
       return (name === '' ? 'DSH' : name).slice(0, 24)
     }
 
+    /** Whether the deployment write key is still missing on this machine. */
+    function boardKeyMissing(options) {
+      return typeof options.boardKey !== 'string' || options.boardKey.trim() === ''
+    }
+
     /** Ask the Host half for this machine's name; it becomes the default label. */
     async function loadHostLabel() {
       if (boardInfo.hostLabel !== '') return
@@ -579,6 +589,7 @@ registerModule({
 
     /** Register (once), recover the code if needed, then claim a channel. */
     async function claimBoard(options) {
+      if (boardKeyMissing(options)) return
       if (boardInfo.channel !== '' && boardInfo.code !== '') return
       if (claimPromise !== null) return claimPromise
       setBoardInfo({ status: 'connecting', message: '' })
@@ -802,6 +813,9 @@ registerModule({
 
     function reportBoard(options, summary) {
       if (!options.boardEnabled) return Promise.resolve()
+      // Without the deployment key every write would 401: skip early and let the
+      // Settings page say what is missing instead of hammering the board.
+      if (boardKeyMissing(options)) return Promise.resolve()
       const state = boardState(options, summary)
       const key = JSON.stringify(state)
       if (key === lastBoardState) return Promise.resolve()
@@ -1343,13 +1357,15 @@ registerModule({
       const previewDetail = previewParts.join(' · ')
       const boardStatus = !options.boardEnabled
         ? t('board.disabled')
-        : board.status === 'connecting'
-          ? t('board.connecting')
-          : board.status === 'error'
-            ? t('board.error', { message: board.message })
-            : board.channel !== ''
-              ? t('board.connected', { channel: board.channel })
-              : t('board.idle')
+        : boardKeyMissing(options)
+          ? t('board.needKey')
+          : board.status === 'connecting'
+            ? t('board.connecting')
+            : board.status === 'error'
+              ? t('board.error', { message: board.message })
+              : board.channel !== ''
+                ? t('board.connected', { channel: board.channel })
+                : t('board.idle')
 
       const connectBoard = () => {
         writeOptions({ boardEnabled: true })
@@ -1602,6 +1618,7 @@ registerModule({
               label: t('option.boardKey'),
               type: 'password',
               value: options.boardKey,
+              placeholder: t('option.boardKey.placeholder'),
               onChange: (value) => writeOptions({ boardKey: value }),
             }),
           ),
@@ -1808,12 +1825,15 @@ registerModule({
       'option.boardSharecode': 'sharecode',
       'option.boardSharecode.hint': '平台链接校验参数，漏了所有请求都会 403。',
       'option.boardKey': '写权限 key',
-      'option.boardKey.hint': '全局写权限密码，等于密码，不要外传。',
+      'option.boardKey.hint':
+        '向看板部署方索取，只存在本机；插件不自带默认值，也不要提交进仓库。',
+      'option.boardKey.placeholder': '向部署方索取',
       'option.boardText': '同步提示词文本',
       'option.boardText.hint':
         '连"几个会话在跑"这类文案一起上报；看板文案公开可读，别放敏感内容。',
       'board.state': '连接状态',
       'board.disabled': '未开启上报',
+      'board.needKey': '请先填写写权限 key（向看板部署方索取）',
       'board.idle': '尚未连接看板，点「连接看板」自动注册并认领通道',
       'board.connecting': '正在连接看板…',
       'board.connected': '已连接，通道 {channel}',
@@ -1899,12 +1919,15 @@ registerModule({
       'option.boardSharecode': 'sharecode',
       'option.boardSharecode.hint': 'Link validation token; every request 403s without it.',
       'option.boardKey': 'Control key',
-      'option.boardKey.hint': 'Deployment-wide write password — treat it as a secret.',
+      'option.boardKey.hint':
+        'Ask the board operator for it; it is stored on this machine only. The plugin ships no default — never commit it.',
+      'option.boardKey.placeholder': 'Ask the board operator',
       'option.boardText': 'Sync the caption',
       'option.boardText.hint':
         'Also sends "how many sessions are running". The board is public: never put secrets there.',
       'board.state': 'Connection',
       'board.disabled': 'Reporting is off',
+      'board.needKey': 'Enter the control key first (ask the board operator)',
       'board.idle': 'Not connected yet — press "Connect" to register and claim a channel',
       'board.connecting': 'Connecting to the board…',
       'board.connected': 'Connected, channel {channel}',
