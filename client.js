@@ -1138,6 +1138,12 @@ registerModule({
       const board = useBoardInfo()
       const enabled = options.boardEnabled
 
+      // The caption carries the wait time, so the red clock must run even when no
+      // lamp is mounted (collapsed rail, title-bar foot hidden).
+      React.useEffect(() => {
+        noteRedSince(summary.state)
+      }, [summary.state])
+
       React.useEffect(() => {
         if (!enabled) return undefined
         const timer = window.setTimeout(() => {
