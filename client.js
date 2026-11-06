@@ -79,6 +79,7 @@ registerModule({
     const API_RECOVER = '/api/device/recover'
     const API_CLAIM = '/api/claim'
     const API_SET = '/api/set'
+    const API_ALIAS = '/api/alias'
 
     /** Same-origin route the Host half mounts to perform the real request. */
     const BOARD_PROXY = '/dsh-traffic-light/api/board/report'
@@ -354,6 +355,8 @@ registerModule({
         secret: typeof source.secret === 'string' ? source.secret : '',
         code: typeof source.code === 'string' ? source.code : '',
         channel,
+        /** Alias the channel currently carries on the board. */
+        alias: typeof source.alias === 'string' ? source.alias : '',
         /** This machine's name, reported by the Host half; the default label. */
         hostLabel: typeof source.hostLabel === 'string' ? source.hostLabel : '',
         status: channel === '' ? 'idle' : 'ready',
@@ -371,6 +374,7 @@ registerModule({
             secret: info.secret,
             code: info.code,
             channel: info.channel,
+            alias: info.alias,
             hostLabel: info.hostLabel,
           }),
         )
@@ -584,6 +588,7 @@ registerModule({
         let secret = boardInfo.secret
         let code = boardInfo.code
         let channel = ''
+        let alias = ''
 
         if (code === '' || secret === '') {
           const registered = await boardRequest(
@@ -604,6 +609,7 @@ registerModule({
             )
             code = typeof recovered.code === 'string' ? recovered.code : ''
             channel = typeof recovered.channel === 'string' ? recovered.channel : ''
+            alias = typeof recovered.alias === 'string' ? recovered.alias : ''
           }
           if (code === '') throw new Error('注册设备没有返回控制码')
         }
@@ -614,10 +620,11 @@ registerModule({
             { method: 'POST' },
           )
           channel = typeof claimed.channel === 'string' ? claimed.channel : ''
+          alias = typeof claimed.alias === 'string' ? claimed.alias : ''
         }
         if (channel === '') throw new Error('认领通道没有返回通道 ID')
 
-        setBoardInfo({ deviceId, code, secret, channel, status: 'ready', message: '' })
+        setBoardInfo({ deviceId, code, secret, channel, alias, status: 'ready', message: '' })
       })()
       try {
         await claimPromise
@@ -626,6 +633,38 @@ registerModule({
         throw error
       } finally {
         claimPromise = null
+      }
+    }
+
+    /**
+     * Keep the channel alias in step with the configured device name.
+     *
+     * The alias is fixed when the channel is claimed, so renaming the machine
+     * (or leaving the name empty so the hostname applies) would otherwise leave
+     * the old label on the board forever. A refused rename — duplicate alias,
+     * quota, wrong key — must never block the status write.
+     *
+     * @param {any} options current options.
+     * @returns {Promise<void>} resolves either way.
+     */
+    async function syncAlias(options) {
+      if (boardInfo.channel === '' || boardInfo.code === '') return
+      const alias = readBoardName(options)
+      if (alias === boardInfo.alias) return
+      try {
+        await boardRequest(
+          boardUrl(options, API_ALIAS, { channel: boardInfo.channel, alias }),
+          {
+            method: 'POST',
+            headers: {
+              'X-Control-Key': options.boardKey,
+              'X-Control-Code': boardInfo.code,
+            },
+          },
+        )
+        setBoardInfo({ alias })
+      } catch (error) {
+        // Ignored on purpose: the lamp colour matters more than the label.
       }
     }
 
@@ -748,6 +787,7 @@ registerModule({
           pendingBoardReport = null
           if (job.key === lastBoardState) continue
           await claimBoard(job.options)
+          await syncAlias(job.options)
           await postBoardState(job.options, job.state)
           lastBoardState = job.key
           setBoardInfo({ status: 'ready', message: '' })

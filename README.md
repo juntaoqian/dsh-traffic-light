@@ -188,6 +188,7 @@ DSH 在安装 Git 仓库前会先用 `git ls-remote` 做一次连通性检查（
 - 首次开启依次调用 `POST /api/device/register` → 用返回的 `secret` 换 `code` → `POST /api/claim` 认领通道；`deviceId / secret / code / channel` 存进 `localStorage` 的 `dsh.traffic-light.board.v1`。
 - 写状态时 `sharecode / channel / status / label / text / duration` 全部放 **URL 查询串**，`X-Control-Key` / `X-Control-Code` 放请求头（不进访问日志）。
 - 通道在服务端消失（404）时会用 `deviceId + secret` 取回控制码、重新认领一次再重试。
+- 改「看板设备名」（或同名留空、由本机名接手）后，下一次上报会调 `POST /api/alias` 把通道别名同步过去；只有名字真的变了才调，失败也不影响灯色上报。
 - 请求由 **Host 半边**（Node）经同源代理 `/dsh-traffic-light/api/board/report` 发出，渲染进程的 CSP / 跨域都挡不住；代理不可用时自动回退浏览器直连。本机名走同一侧的同源路由 `/dsh-traffic-light/api/board/info`（只允许本机访问）。
 - 没有心跳：关掉页面后看板停在最后一次状态（避免多余请求与限流）。
 
