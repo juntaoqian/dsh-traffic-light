@@ -88,6 +88,8 @@ registerModule({
 
     /** Same-origin route the Host half mounts to perform the real request. */
     const BOARD_PROXY = '/dsh-traffic-light/api/board/report'
+    /** Same-origin route the Host half mounts to render the channel QR. */
+    const BOARD_QR = '/dsh-traffic-light/api/board/qr'
     /** Same-origin route that reports this machine's name, used as the default label. */
     const BOARD_INFO = '/dsh-traffic-light/api/board/info'
 
@@ -837,9 +839,50 @@ registerModule({
       })
     }
 
-    function boardPageUrl(options) {
+    function boardPageUrl(options, channel) {
       const base = String(options.boardBase || '').replace(/\/+$/, '')
-      return `${base}/?sharecode=${encodeURIComponent(options.boardSharecode)}`
+      const link = `${base}/?sharecode=${encodeURIComponent(options.boardSharecode)}`
+      return channel === undefined || channel === '' ? link : `${link}&channel=${encodeURIComponent(channel)}`
+    }
+
+    /**
+     * Parse one access code into board settings.
+     *
+     * One field replaces the five settings, so a user only needs what the board
+     * operator already hands out: a link. Accepted forms, in order:
+     *   https://host/?sharecode=SC[&key=KEY]  board link (key optional)
+     *   https://host|SC|KEY                   compact form, for chat/QR
+     *   SC                                    bare sharecode, current base/key kept
+     *
+     * @param {string} raw pasted text.
+     * @returns {{base?: string, sharecode: string, key?: string}|null} parsed code.
+     */
+    function parseAccessCode(raw) {
+      const text = String(raw === undefined || raw === null ? '' : raw).trim()
+      if (text === '') return null
+
+      if (/^https?:\/\//i.test(text)) {
+        try {
+          const url = new URL(text)
+          const sharecode = url.searchParams.get('sharecode') ?? ''
+          if (sharecode !== '') {
+            const key = url.searchParams.get('key') ?? url.searchParams.get('control') ?? ''
+            return { base: `${url.protocol}//${url.host}`, sharecode, key }
+          }
+        } catch (error) {
+          // Not a link after all: fall through to the compact form.
+        }
+      }
+
+      if (text.includes('|')) {
+        const [base, sharecode, key] = text.split('|').map((part) => part.trim())
+        if (sharecode === undefined || sharecode === '') return null
+        if (base === undefined || !/^https?:\/\//i.test(base)) return null
+        return { base: base.replace(/\/+$/, ''), sharecode, key: key === undefined ? '' : key }
+      }
+
+      if (/^[A-Za-z0-9_-]{6,64}$/.test(text)) return { sharecode: text }
+      return null
     }
 
     // ---------------------------------------------------------------------
@@ -1331,12 +1374,35 @@ registerModule({
       const { options, summary } = useSummary(props.useSessionStatus)
       const board = useBoardInfo()
       const [resetDone, setResetDone] = React.useState(false)
+      const [qrSvg, setQrSvg] = React.useState('')
+      const [codeNote, setCodeNote] = React.useState('')
 
       React.useEffect(() => {
         if (!resetDone) return undefined
         const timer = window.setTimeout(() => setResetDone(false), 2000)
         return () => window.clearTimeout(timer)
       }, [resetDone])
+
+      // The QR encodes the channel link; the Host half renders it so the client
+      // needs no QR encoder of its own.
+      React.useEffect(() => {
+        if (!options.boardEnabled || board.channel === '') {
+          setQrSvg('')
+          return undefined
+        }
+        const link = boardPageUrl(options, board.channel)
+        let alive = true
+        fetch(`${BOARD_QR}?text=${encodeURIComponent(link)}`)
+          .then((response) => (response.ok ? response.json() : null))
+          .then((data) => {
+            if (!alive || data === null || typeof data.svg !== 'string') return
+            setQrSvg(data.svg)
+          })
+          .catch(() => {})
+        return () => {
+          alive = false
+        }
+      }, [board.channel, options.boardEnabled, options.boardBase, options.boardSharecode])
 
       const stateLabel = t(`state.${summary.state}`)
       const elapsed = useRedElapsed(summary.state)
@@ -1378,6 +1444,43 @@ registerModule({
       const submitBoard = () => {
         lastBoardState = ''
         reportBoard(readOptions(), summary).catch(() => {})
+      }
+
+      /**
+       * One-field onboarding: a board link (or `base|sharecode|key`) both fills
+       * the technical settings and connects, so nobody types five values.
+       */
+      const connectFromCode = (raw) => {
+        const parsed = parseAccessCode(raw)
+        if (parsed === null) {
+          setCodeNote(t('board.code.bad'))
+          return
+        }
+        const current = readOptions()
+        writeOptions({
+          boardEnabled: true,
+          boardBase: parsed.base === undefined ? current.boardBase : parsed.base,
+          boardSharecode: parsed.sharecode,
+          boardKey:
+            parsed.key === undefined || parsed.key === '' ? current.boardKey : parsed.key,
+        })
+        lastBoardState = ''
+        setCodeNote(
+          readOptions().boardKey === '' ? t('board.needKey') : t('board.code.ok'),
+        )
+        claimBoard(readOptions())
+          .then(() => reportBoard(readOptions(), summary))
+          .catch(() => {})
+      }
+
+      const copyLink = () => {
+        const link = boardPageUrl(readOptions(), board.channel)
+        try {
+          void navigator.clipboard.writeText(link)
+          setCodeNote(t('board.code.copied'))
+        } catch (error) {
+          setCodeNote(link)
+        }
       }
 
       return h(
@@ -1571,6 +1674,49 @@ registerModule({
           h('div', { className: 'dsh-traffic-light-group' }, t('group.board')),
           h(
             Row,
+            {
+              label: t('option.boardCode'),
+              hint: codeNote === '' ? t('option.boardCode.hint') : codeNote,
+            },
+            h(
+              'div',
+              { className: 'dsh-traffic-light-inline' },
+              h(TextField, {
+                label: t('option.boardCode'),
+                value: '',
+                placeholder: t('option.boardCode.placeholder'),
+                onChange: connectFromCode,
+              }),
+              h(Button, { label: t('action.board.connect'), onClick: connectBoard }),
+            ),
+          ),
+          board.channel === '' || qrSvg === ''
+            ? null
+            : h(
+                'div',
+                { className: 'dsh-traffic-light-qr' },
+                h('div', {
+                  className: 'dsh-traffic-light-qr__code',
+                  dangerouslySetInnerHTML: { __html: qrSvg },
+                }),
+                h(
+                  'div',
+                  { className: 'dsh-traffic-light-qr__meta' },
+                  h('strong', null, t('board.qr.title')),
+                  h('span', { className: 'dsh-traffic-light-qr__link' }, boardPageUrl(options, board.channel)),
+                  h(
+                    'div',
+                    { className: 'dsh-traffic-light-inline' },
+                    h(Button, { label: t('action.board.copy'), onClick: copyLink }),
+                    h(Button, {
+                      label: t('action.board.open'),
+                      onClick: () => window.open(boardPageUrl(options, board.channel), '_blank'),
+                    }),
+                  ),
+                ),
+              ),
+          h(
+            Row,
             { label: t('option.board'), hint: t('option.board.hint') },
             h(Switch, {
               checked: options.boardEnabled,
@@ -1582,57 +1728,62 @@ registerModule({
             }),
           ),
           h(
-            Row,
-            { label: t('option.boardName'), hint: t('option.boardName.hint') },
-            h(TextField, {
-              label: t('option.boardName'),
-              value: options.boardName,
-              placeholder: t('option.boardName.auto', {
-                name: board.hostLabel === '' ? 'DSH' : board.hostLabel,
+            'details',
+            { className: 'dsh-traffic-light-advanced' },
+            h('summary', null, t('board.advanced')),
+            h(
+              Row,
+              { label: t('option.boardName'), hint: t('option.boardName.hint') },
+              h(TextField, {
+                label: t('option.boardName'),
+                value: options.boardName,
+                placeholder: t('option.boardName.auto', {
+                  name: board.hostLabel === '' ? 'DSH' : board.hostLabel,
+                }),
+                onChange: (value) => writeOptions({ boardName: value }),
               }),
-              onChange: (value) => writeOptions({ boardName: value }),
-            }),
-          ),
-          h(
-            Row,
-            { label: t('option.boardBase'), hint: t('option.boardBase.hint') },
-            h(TextField, {
-              label: t('option.boardBase'),
-              value: options.boardBase,
-              onChange: (value) => writeOptions({ boardBase: value }),
-            }),
-          ),
-          h(
-            Row,
-            { label: t('option.boardSharecode'), hint: t('option.boardSharecode.hint') },
-            h(TextField, {
-              label: t('option.boardSharecode'),
-              value: options.boardSharecode,
-              onChange: (value) => writeOptions({ boardSharecode: value }),
-            }),
-          ),
-          h(
-            Row,
-            { label: t('option.boardKey'), hint: t('option.boardKey.hint') },
-            h(TextField, {
-              label: t('option.boardKey'),
-              type: 'password',
-              value: options.boardKey,
-              placeholder: t('option.boardKey.placeholder'),
-              onChange: (value) => writeOptions({ boardKey: value }),
-            }),
-          ),
-          h(
-            Row,
-            { label: t('option.boardText'), hint: t('option.boardText.hint') },
-            h(Switch, {
-              checked: options.boardText,
-              label: t('option.boardText'),
-              onChange: (value) => {
-                writeOptions({ boardText: value })
-                submitBoard()
-              },
-            }),
+            ),
+            h(
+              Row,
+              { label: t('option.boardBase'), hint: t('option.boardBase.hint') },
+              h(TextField, {
+                label: t('option.boardBase'),
+                value: options.boardBase,
+                onChange: (value) => writeOptions({ boardBase: value }),
+              }),
+            ),
+            h(
+              Row,
+              { label: t('option.boardSharecode'), hint: t('option.boardSharecode.hint') },
+              h(TextField, {
+                label: t('option.boardSharecode'),
+                value: options.boardSharecode,
+                onChange: (value) => writeOptions({ boardSharecode: value }),
+              }),
+            ),
+            h(
+              Row,
+              { label: t('option.boardKey'), hint: t('option.boardKey.hint') },
+              h(TextField, {
+                label: t('option.boardKey'),
+                type: 'password',
+                value: options.boardKey,
+                placeholder: t('option.boardKey.placeholder'),
+                onChange: (value) => writeOptions({ boardKey: value }),
+              }),
+            ),
+            h(
+              Row,
+              { label: t('option.boardText'), hint: t('option.boardText.hint') },
+              h(Switch, {
+                checked: options.boardText,
+                label: t('option.boardText'),
+                onChange: (value) => {
+                  writeOptions({ boardText: value })
+                  submitBoard()
+                },
+              }),
+            ),
           ),
           h(
             Row,
@@ -1640,7 +1791,6 @@ registerModule({
             h(
               'div',
               { className: 'dsh-traffic-light-inline' },
-              h(Button, { label: t('action.board.connect'), onClick: connectBoard }),
               h(Button, { label: t('action.board.report'), onClick: submitBoard }),
               h(Button, {
                 label: t('action.board.forget'),
@@ -1740,6 +1890,14 @@ registerModule({
 .dsh-traffic-light-button:hover{background:var(--dsw-alias-bg-layer-2)}
 .dsh-traffic-light-button:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
 .dsh-traffic-light-actions{display:flex;align-items:center;gap:10px;padding-top:2px}
+.dsh-traffic-light-advanced{margin:4px 0 0}
+.dsh-traffic-light-advanced>summary{cursor:pointer;padding:6px 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+.dsh-traffic-light-advanced>summary:hover{color:var(--dsw-alias-label-secondary)}
+.dsh-traffic-light-qr{display:flex;align-items:center;gap:14px;padding:12px 14px;border:.5px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}
+.dsh-traffic-light-qr__code{flex:none;width:132px;height:132px;padding:6px;box-sizing:border-box;border-radius:8px;background:#fff}
+.dsh-traffic-light-qr__code svg{display:block;width:100%;height:100%}
+.dsh-traffic-light-qr__meta{display:flex;flex-direction:column;gap:6px;min-width:0;font-size:13px;line-height:20px}
+.dsh-traffic-light-qr__link{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary);word-break:break-all}
 .dsh-traffic-light-reset{font-size:12px;color:var(--dsw-alias-state-success-primary)}
 .dsh-traffic-light-group{margin:18px 0 2px;font-size:12px;font-weight:600;line-height:18px;color:var(--dsw-alias-label-tertiary)}
 .dsh-traffic-light-text{width:240px;height:26px;padding:0 8px;box-sizing:border-box;border-radius:6px;border:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px}
@@ -1816,6 +1974,15 @@ registerModule({
       'option.board': '上报状态到看板',
       'option.board.hint':
         '把左下角的灯色同步到公网看板：绿=运行中、黄=空闲、红=等你操作。第一次开启会自动注册本机设备并认领通道。',
+      'option.boardCode': '接入码',
+      'option.boardCode.hint': '粘贴看板链接或接入码，回车即自动注册并连接。',
+      'option.boardCode.placeholder': '粘贴链接，回车连接',
+      'board.code.ok': '已按接入码连接',
+      'board.code.bad': '接入码无法识别：请粘贴含 sharecode 的看板链接',
+      'board.code.copied': '链接已复制',
+      'board.advanced': '高级设置（设备名 / 看板地址 / sharecode / 写权限 key）',
+      'board.qr.title': '手机扫码看这台机器',
+      'action.board.copy': '复制链接',
       'option.boardName': '看板设备名',
       'option.boardName.hint':
         '看板上显示的名字，也是注册设备时用的名字，最多 24 字；留空则用本机名。',
@@ -1910,6 +2077,15 @@ registerModule({
       'option.board': 'Report status to the board',
       'option.board.hint':
         'Mirrors the lamps to the public board: green = running, amber = idle, red = waiting for you. Turning it on registers this machine and claims a channel once.',
+      'option.boardCode': 'Access code',
+      'option.boardCode.hint': 'Paste the board link or access code and press Enter to connect.',
+      'option.boardCode.placeholder': 'Paste a link, press Enter',
+      'board.code.ok': 'Connected from the access code',
+      'board.code.bad': 'Unrecognised access code: paste a board link that carries a sharecode',
+      'board.code.copied': 'Link copied',
+      'board.advanced': 'Advanced (device name / board URL / sharecode / control key)',
+      'board.qr.title': 'Scan to watch this machine',
+      'action.board.copy': 'Copy link',
       'option.boardName': 'Board device name',
       'option.boardName.hint':
         'Shown on the board and used when registering the device, up to 24 characters; leave empty to use this machine’s name.',
@@ -2032,6 +2208,8 @@ registerModule({
       )
     }
 
-    return { inject: ['slots', 'locale'], apply }
+    // `parseAccessCode` is exposed alongside the plugin surface so the access-code
+    // grammar can be exercised directly; DSH only reads `inject` and `apply`.
+    return { inject: ['slots', 'locale'], apply, parseAccessCode }
   },
 })

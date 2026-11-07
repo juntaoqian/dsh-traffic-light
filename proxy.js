@@ -19,6 +19,8 @@
 
 import { hostname } from 'node:os'
 
+import qrcode from './qrcode-generator.js'
+
 /** Route registered on the DSH web server. */
 export const PROXY_PATH = '/dsh-traffic-light/api/board'
 
@@ -117,6 +119,38 @@ function forwardHeaders(supplied) {
   }
   return headers
 }
+/**
+ * Render one QR code as an inline SVG.
+ *
+ * The board has no pairing endpoint, so the plugin cannot "scan to connect";
+ * it shows a code instead: the phone scans it and opens this machine's channel.
+ *
+ * @param {string} text payload to encode.
+ * @returns {string|null} SVG markup, or null when the payload does not fit.
+ */
+function renderQrSvg(text) {
+  try {
+    const qr = qrcode(0, 'M')
+    qr.addData(text)
+    qr.make()
+    const count = qr.getModuleCount()
+    const quiet = 2
+    const size = count + quiet * 2
+    let path = ''
+    for (let row = 0; row < count; row += 1) {
+      for (let col = 0; col < count; col += 1) {
+        if (qr.isDark(row, col)) path += `M${col + quiet} ${row + quiet}h1v1h-1z`
+      }
+    }
+    return (
+      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" ` +
+      `shape-rendering="crispEdges"><rect width="${size}" height="${size}" fill="#ffffff"/>` +
+      `<path d="${path}" fill="#000000"/></svg>`
+    )
+  } catch {
+    return null
+  }
+}
 
 /**
  * Build the request handler mounted on the DSH web server.
@@ -144,6 +178,27 @@ export function createBoardProxy(options = {}) {
         return
       }
       sendJson(response, 200, { ok: true, hostname: hostname(), platform: process.platform })
+      return
+    }
+
+    // `/qr` renders the channel link as an SVG QR for the phone to scan.
+    if (suffix === '/qr') {
+      if ((request.method ?? 'GET').toUpperCase() !== 'GET') {
+        response.setHeader('allow', 'GET')
+        sendJson(response, 405, { ok: false, error: '只支持 GET', status: 0 })
+        return
+      }
+      const text = url.searchParams.get('text') ?? ''
+      if (text === '' || text.length > 600) {
+        sendJson(response, 400, { ok: false, error: '二维码内容为空或过长', status: 0 })
+        return
+      }
+      const svg = renderQrSvg(text)
+      if (svg === null) {
+        sendJson(response, 400, { ok: false, error: '内容过长，无法生成二维码', status: 0 })
+        return
+      }
+      sendJson(response, 200, { ok: true, svg })
       return
     }
 
