@@ -86,6 +86,23 @@ registerModule({
     const API_SET = '/api/set'
     const API_ALIAS = '/api/alias'
 
+    /**
+     * Pairing protocol (v1). The board side owns these three routes; when they
+     * are missing the plugin degrades to the one-line access code.
+     *
+     *   POST /api/pair/create            → { token, expiresIn, qr? }
+     *   GET  /api/pair/status?token=...  → { status, device?, channel?, code? }
+     *   POST /api/device/ping            → { ok: true }            (liveness)
+     */
+    const API_PAIR_CREATE = '/api/pair/create'
+    const API_PAIR_STATUS = '/api/pair/status'
+    const API_PING = '/api/device/ping'
+
+    /** How often the dialog asks whether the phone has scanned yet. */
+    const PAIR_POLL_MS = 2000
+    /** Liveness beat; the board can mark a channel offline after ~3 misses. */
+    const HEARTBEAT_MS = 20000
+
     /** Same-origin route the Host half mounts to perform the real request. */
     const BOARD_PROXY = '/dsh-traffic-light/api/board/report'
     /** Same-origin route the Host half mounts to render the channel QR. */
@@ -364,6 +381,12 @@ registerModule({
         channel,
         /** Alias the channel currently carries on the board. */
         alias: typeof source.alias === 'string' ? source.alias : '',
+        /** Device name the board reported when the phone paired; persisted. */
+        deviceName: typeof source.deviceName === 'string' ? source.deviceName : '',
+        /** Pending pairing token and the text its QR encodes (never persisted). */
+        pairToken: '',
+        pairQr: '',
+        pairStatus: 'idle',
         /** This machine's name, reported by the Host half; the default label. */
         hostLabel: typeof source.hostLabel === 'string' ? source.hostLabel : '',
         status: channel === '' ? 'idle' : 'ready',
@@ -382,6 +405,7 @@ registerModule({
             code: info.code,
             channel: info.channel,
             alias: info.alias,
+            deviceName: info.deviceName,
             hostLabel: info.hostLabel,
           }),
         )
@@ -678,6 +702,161 @@ registerModule({
         setBoardInfo({ alias })
       } catch (error) {
         // Ignored on purpose: the lamp colour matters more than the label.
+      }
+    }
+
+    /** Whether the board answered 404, i.e. the pairing routes are not deployed. */
+    function isMissingRoute(error) {
+      return error !== null && typeof error === 'object' && error.status === 404
+    }
+
+    /** The deployment key, when this machine has one. */
+    function pairingHeaders(options) {
+      const headers = {}
+      if (typeof options.boardKey === 'string' && options.boardKey.trim() !== '') {
+        headers['X-Control-Key'] = options.boardKey
+      }
+      return headers
+    }
+
+    /**
+     * Ask the board for a one-time pairing token.
+     *
+     * The phone scans the returned QR, the board binds it to a fresh channel and
+     * hands back the control code, so nothing has to be typed on either side.
+     *
+     * @param {any} options current options.
+     * @returns {Promise<{token: string, qrText: string}>} created pairing.
+     */
+    async function createPairing(options) {
+      const created = await boardRequest(boardUrl(options, API_PAIR_CREATE, {}), {
+        method: 'POST',
+        headers: pairingHeaders(options),
+      })
+      const token = typeof created.token === 'string' ? created.token : ''
+      if (token === '') throw new Error('配对接口没有返回 token')
+      const fallbackBase = String(options.boardBase || '').replace(/\/+$/, '')
+      const qrText =
+        typeof created.qr === 'string' && created.qr !== ''
+          ? created.qr
+          : `${fallbackBase}/pair?t=${encodeURIComponent(token)}&s=${encodeURIComponent(options.boardSharecode)}`
+      return { token, qrText }
+    }
+
+    /**
+     * Read the pairing state once and adopt the credentials when it completes.
+     *
+     * @param {any} options current options.
+     * @returns {Promise<'pending'|'paired'|'expired'>} next state.
+     */
+    async function pollPairing(options) {
+      const reply = await boardRequest(
+        boardUrl(options, API_PAIR_STATUS, { token: boardInfo.pairToken }),
+        { method: 'GET', headers: pairingHeaders(options) },
+      )
+      const state = typeof reply.status === 'string' ? reply.status : ''
+      if (state === 'paired') {
+        const device =
+          reply.device !== null && typeof reply.device === 'object' ? reply.device : {}
+        const name =
+          typeof device.name === 'string' && device.name !== ''
+            ? device.name.slice(0, 40)
+            : boardInfo.hostLabel
+        setBoardInfo({
+          pairStatus: 'paired',
+          pairToken: '',
+          pairQr: '',
+          deviceName: name,
+          channel: typeof reply.channel === 'string' ? reply.channel : boardInfo.channel,
+          code: typeof reply.code === 'string' ? reply.code : boardInfo.code,
+          secret: typeof reply.secret === 'string' ? reply.secret : boardInfo.secret,
+          deviceId: typeof device.id === 'string' ? device.id : boardInfo.deviceId,
+          status: 'ready',
+          message: '',
+        })
+        lastBoardState = ''
+        return 'paired'
+      }
+      if (state === 'expired' || state === 'denied') {
+        setBoardInfo({ pairStatus: 'expired', pairToken: '', pairQr: '' })
+        return 'expired'
+      }
+      return 'pending'
+    }
+
+    /** Poll handle for the pending pairing (module scope: one pairing at a time). */
+    let pairTimer = null
+
+    function stopPairTimer() {
+      if (pairTimer !== null) {
+        window.clearInterval(pairTimer)
+        pairTimer = null
+      }
+    }
+
+    function cancelPairing() {
+      stopPairTimer()
+      setBoardInfo({ pairStatus: 'idle', pairToken: '', pairQr: '' })
+    }
+
+    /**
+     * Start the scan-to-pair flow: create a token, show its QR, then poll until
+     * the phone confirms. Degrades to `unsupported` when the board has no route.
+     *
+     * @param {any} options current options.
+     * @returns {Promise<void>} resolves when the flow is armed or refused.
+     */
+    async function startPairing(options) {
+      cancelPairing()
+      writeOptions({ boardEnabled: true })
+      setBoardInfo({ pairStatus: 'waiting', message: '' })
+      let created
+      try {
+        created = await createPairing(options)
+      } catch (error) {
+        if (isMissingRoute(error)) {
+          setBoardInfo({ pairStatus: 'unsupported', message: '' })
+          return
+        }
+        setBoardInfo({ pairStatus: 'error', message: describeBoardFailure(error) })
+        return
+      }
+      setBoardInfo({ pairToken: created.token, pairQr: created.qrText, pairStatus: 'waiting' })
+      pairTimer = window.setInterval(() => {
+        void (async () => {
+          if (boardInfo.pairToken === '') {
+            cancelPairing()
+            return
+          }
+          try {
+            const next = await pollPairing(options)
+            if (next !== 'pending') stopPairTimer()
+          } catch (error) {
+            if (isMissingRoute(error)) {
+              cancelPairing()
+              setBoardInfo({ pairStatus: 'unsupported' })
+            }
+            // Any other failure is transient: the phone may still be scanning.
+          }
+        })()
+      }, PAIR_POLL_MS)
+    }
+
+    /** Liveness beat so the board can show the device as online. */
+    async function pingBoard(options) {
+      try {
+        await boardRequest(
+          boardUrl(options, API_PING, { channel: boardInfo.channel }),
+          {
+            method: 'POST',
+            headers: {
+              'X-Control-Key': options.boardKey,
+              'X-Control-Code': boardInfo.code,
+            },
+          },
+        )
+      } catch (error) {
+        // Older boards have no ping route; the lamp colour is unaffected.
       }
     }
 
@@ -1221,6 +1400,20 @@ registerModule({
         options.boardText,
       ])
 
+      // Liveness: the board marks the device offline after a few missed beats,
+      // so a closed page does not look like a red light.
+      React.useEffect(() => {
+        if (!enabled || board.channel === '') return undefined
+        const beat = () => {
+          const current = readOptions()
+          if (boardKeyMissing(current)) return
+          void pingBoard(current)
+        }
+        beat()
+        const timer = window.setInterval(beat, HEARTBEAT_MS)
+        return () => window.clearInterval(timer)
+      }, [enabled, board.channel])
+
       return null
     }
 
@@ -1383,16 +1576,22 @@ registerModule({
         return () => window.clearTimeout(timer)
       }, [resetDone])
 
-      // The QR encodes the channel link; the Host half renders it so the client
-      // needs no QR encoder of its own.
+      // The QR is the pairing token while waiting for the phone, then the
+      // channel link. The Host half renders it, so the client needs no encoder.
+      const qrTarget =
+        board.pairStatus === 'waiting' && board.pairQr !== ''
+          ? board.pairQr
+          : board.channel === ''
+            ? ''
+            : boardPageUrl(options, board.channel)
+
       React.useEffect(() => {
-        if (!options.boardEnabled || board.channel === '') {
+        if (qrTarget === '') {
           setQrSvg('')
           return undefined
         }
-        const link = boardPageUrl(options, board.channel)
         let alive = true
-        fetch(`${BOARD_QR}?text=${encodeURIComponent(link)}`)
+        fetch(`${BOARD_QR}?text=${encodeURIComponent(qrTarget)}`)
           .then((response) => (response.ok ? response.json() : null))
           .then((data) => {
             if (!alive || data === null || typeof data.svg !== 'string') return
@@ -1402,7 +1601,7 @@ registerModule({
         return () => {
           alive = false
         }
-      }, [board.channel, options.boardEnabled, options.boardBase, options.boardSharecode])
+      }, [qrTarget])
 
       const stateLabel = t(`state.${summary.state}`)
       const elapsed = useRedElapsed(summary.state)
@@ -1482,6 +1681,33 @@ registerModule({
           setCodeNote(link)
         }
       }
+
+      const startPair = () => {
+        void startPairing(readOptions())
+      }
+
+      const forgetAll = () => {
+        cancelPairing()
+        forgetBoard()
+        writeOptions({ boardEnabled: false })
+      }
+
+      const pairHint =
+        board.pairStatus === 'waiting'
+          ? t('board.pair.waiting')
+          : board.pairStatus === 'unsupported'
+            ? t('board.pair.unsupported')
+            : board.pairStatus === 'expired'
+              ? t('board.pair.expired')
+              : board.pairStatus === 'error'
+                ? t('board.error', { message: board.message })
+                : board.channel !== ''
+                  ? t('board.device', {
+                      name:
+                        board.deviceName === '' ? readBoardName(readOptions()) : board.deviceName,
+                      channel: board.channel,
+                    })
+                  : t('board.pair.hint')
 
       return h(
         'div',
@@ -1674,23 +1900,19 @@ registerModule({
           h('div', { className: 'dsh-traffic-light-group' }, t('group.board')),
           h(
             Row,
-            {
-              label: t('option.boardCode'),
-              hint: codeNote === '' ? t('option.boardCode.hint') : codeNote,
-            },
+            { label: t('board.pair'), hint: pairHint },
             h(
               'div',
               { className: 'dsh-traffic-light-inline' },
-              h(TextField, {
-                label: t('option.boardCode'),
-                value: '',
-                placeholder: t('option.boardCode.placeholder'),
-                onChange: connectFromCode,
-              }),
-              h(Button, { label: t('action.board.connect'), onClick: connectBoard }),
+              board.pairStatus === 'waiting'
+                ? h(Button, { label: t('board.pair.cancel'), onClick: cancelPairing })
+                : h(Button, { label: t('board.pair.start'), onClick: startPair }),
+              board.channel === ''
+                ? null
+                : h(Button, { label: t('action.board.forget'), onClick: forgetAll }),
             ),
           ),
-          board.channel === '' || qrSvg === ''
+          qrSvg === ''
             ? null
             : h(
                 'div',
@@ -1702,17 +1924,29 @@ registerModule({
                 h(
                   'div',
                   { className: 'dsh-traffic-light-qr__meta' },
-                  h('strong', null, t('board.qr.title')),
-                  h('span', { className: 'dsh-traffic-light-qr__link' }, boardPageUrl(options, board.channel)),
                   h(
-                    'div',
-                    { className: 'dsh-traffic-light-inline' },
-                    h(Button, { label: t('action.board.copy'), onClick: copyLink }),
-                    h(Button, {
-                      label: t('action.board.open'),
-                      onClick: () => window.open(boardPageUrl(options, board.channel), '_blank'),
-                    }),
+                    'strong',
+                    null,
+                    board.pairStatus === 'waiting' ? t('board.pair.qrTitle') : t('board.qr.title'),
                   ),
+                  board.pairStatus === 'waiting'
+                    ? h('span', { className: 'dsh-traffic-light-qr__link' }, t('board.pair.waiting'))
+                    : h(
+                        'span',
+                        { className: 'dsh-traffic-light-qr__link' },
+                        boardPageUrl(options, board.channel),
+                      ),
+                  board.pairStatus === 'waiting'
+                    ? null
+                    : h(
+                        'div',
+                        { className: 'dsh-traffic-light-inline' },
+                        h(Button, { label: t('action.board.copy'), onClick: copyLink }),
+                        h(Button, {
+                          label: t('action.board.open'),
+                          onClick: () => window.open(boardPageUrl(options, board.channel), '_blank'),
+                        }),
+                      ),
                 ),
               ),
           h(
@@ -1731,6 +1965,24 @@ registerModule({
             'details',
             { className: 'dsh-traffic-light-advanced' },
             h('summary', null, t('board.advanced')),
+            h(
+              Row,
+              {
+                label: t('option.boardCode'),
+                hint: codeNote === '' ? t('option.boardCode.hint') : codeNote,
+              },
+              h(
+                'div',
+                { className: 'dsh-traffic-light-inline' },
+                h(TextField, {
+                  label: t('option.boardCode'),
+                  value: '',
+                  placeholder: t('option.boardCode.placeholder'),
+                  onChange: connectFromCode,
+                }),
+                h(Button, { label: t('action.board.connect'), onClick: connectBoard }),
+              ),
+            ),
             h(
               Row,
               { label: t('option.boardName'), hint: t('option.boardName.hint') },
@@ -1999,6 +2251,16 @@ registerModule({
       'option.boardText.hint':
         '连"几个会话在跑"这类文案一起上报；看板文案公开可读，别放敏感内容。',
       'board.state': '连接状态',
+      'board.pair': '扫码配对',
+      'board.pair.hint':
+        '点「生成二维码」，手机扫一下即可把这台设备接到看板（需要看板支持 /api/pair）。',
+      'board.pair.start': '生成二维码',
+      'board.pair.cancel': '取消配对',
+      'board.pair.waiting': '等待手机扫码…',
+      'board.pair.qrTitle': '手机扫码配对本机',
+      'board.pair.unsupported': '看板还不支持扫码配对，请用「高级设置 → 接入码」',
+      'board.pair.expired': '配对已过期，重新生成一次',
+      'board.device': '已连接设备：{name}（通道 {channel}）',
       'board.disabled': '未开启上报',
       'board.needKey': '请先填写写权限 key（向看板部署方索取）',
       'board.idle': '尚未连接看板，点「连接看板」自动注册并认领通道',
@@ -2102,6 +2364,16 @@ registerModule({
       'option.boardText.hint':
         'Also sends "how many sessions are running". The board is public: never put secrets there.',
       'board.state': 'Connection',
+      'board.pair': 'Pair by QR',
+      'board.pair.hint':
+        'Press “Show QR” and scan it with your phone to attach this device to the board (needs /api/pair on the board).',
+      'board.pair.start': 'Show QR',
+      'board.pair.cancel': 'Cancel pairing',
+      'board.pair.waiting': 'Waiting for the phone to scan…',
+      'board.pair.qrTitle': 'Scan to pair this machine',
+      'board.pair.unsupported': 'This board has no pairing route — use “Advanced → access code”',
+      'board.pair.expired': 'Pairing expired — generate a new code',
+      'board.device': 'Paired with {name} (channel {channel})',
       'board.disabled': 'Reporting is off',
       'board.needKey': 'Enter the control key first (ask the board operator)',
       'board.idle': 'Not connected yet — press "Connect" to register and claim a channel',

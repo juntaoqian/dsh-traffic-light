@@ -150,9 +150,48 @@ DSH 在安装 Git 仓库前会先用 `git ls-remote` 做一次连通性检查（
 
 一句话：让一块公网可见的看板显示这台机器**在跑、空闲，还是在等你操作**。
 
-### 一条接入码开起来
+### 扫码配对（推荐）
 
-Settings → 红绿灯 → 公网看板 → **接入码**，把下面任意一种粘进去，回车即可：
+Settings → 红绿灯 → 公网看板 → 点 **生成二维码**，手机扫一下即可：
+
+```
+电脑：生成配对二维码  →  手机扫码  →  看板页面确认  →  插件自动拿到 code / channel
+```
+
+成功后设置页显示 **已连接设备：`iPhone-15`（通道 `ch-pair-1`）**，二维码自动切换成「这条通道」的链接，可复制发给别人。
+
+配对期间插件每 2 秒问一次结果，`token` 过期就提示重新生成；看板没有这些路由时直接降级成「接入码」方式，不会卡住。
+
+#### 服务端要实现的三个接口（契约 v1）
+
+```http
+POST {BASE}/api/pair/create?sharecode=SC
+     X-Control-Key: <部署 key，可选>
+→ 200 { "ok": true, "token": "PT-3f9a", "expiresIn": 300,
+        "qr": "https://<base>/pair?t=PT-3f9a" }      # qr 省略时插件按 /pair?t=&s= 自行拼
+
+GET  {BASE}/api/pair/status?sharecode=SC&token=PT-3f9a
+→ 200 { "ok": true, "status": "pending" }
+→ 200 { "ok": true, "status": "paired",
+        "device": { "id": "dev-1", "name": "iPhone-15" },
+        "channel": "ch-pair-1", "code": "TL-PAIR-0001" }    # 也可回 secret
+→ 200 { "ok": true, "status": "expired" }                     # 或 "denied"
+
+POST {BASE}/api/device/ping?sharecode=SC&channel=ch-pair-1
+     X-Control-Key: <部署 key>    X-Control-Code: TL-PAIR-0001
+→ 200 { "ok": true }
+```
+
+约定：
+
+- `token` 一次性，建议 5 分钟过期。手机扫码后由**看板页面**调 `POST /api/pair/confirm`（body 带 `token`）把它标记为 paired，并在这一步分配 `device` / `channel` / `code`——分配逻辑复用现有 `/api/device/register` + `/api/claim` 即可。
+- 插件拿到 `code` 后**立刻**用原有的 `POST /api/set` 上报，不需要再注册一次设备。
+- `ping` 每 20 秒一次；建议服务端 **30–60 秒收不到就显示离线**，这样关掉页面不会一直挂着最后一盏灯。
+- 三条路由任一返回 404，插件判定「看板不支持配对」，回退到接入码，并在设置页写明原因。
+
+### 接入码（备用，不需要改服务端）
+
+Settings → 红绿灯 → 公网看板 → 高级设置 → **接入码**，把下面任意一种粘进去，回车即可：
 
 ```
 https://traffic-light-control-97708.app.workbuddy.host/?sharecode=3R6XRRCJN6      看板链接
